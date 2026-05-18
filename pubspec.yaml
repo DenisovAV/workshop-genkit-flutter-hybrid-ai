@@ -12,13 +12,13 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
 
-  # Step 2: Cloud AI via Gemini API
-  genkit: ^0.13.0
-  genkit_google_genai: ^0.2.7
+  # Step 2: Uncomment to add Cloud AI
+  # genkit: ^0.13.0
+  # genkit_google_genai: ^0.2.7
 
-  # Step 3: On-device AI via genkit_flutter_gemma
-  genkit_flutter_gemma: ^0.3.1
-  flutter_gemma: ^0.15.1
+  # Step 3: Uncomment to add On-device AI
+  # genkit_flutter_gemma: ^0.3.1
+  # flutter_gemma: ^0.15.1
 
 dev_dependencies:
   flutter_test:
