@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
 import '../models/message_model.dart';
 import '../services/cloud_ai_service.dart';
-import '../services/hybrid_ai_service.dart';
 import '../services/local_ai_service.dart';
-import '../services/rag_service.dart';
 import '../widgets/message_bubble.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -20,23 +18,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _isGenerating = false;
   bool _isInitializing = true;
-  double _downloadProgress = 0;
   String _statusMessage = 'Initializing...';
-
-  bool _cloudReady = false;
-  bool _localReady = false;
-  bool _ragReady = false;
 
   late final CloudAIService _cloudService;
   late final LocalAIService _localService;
-  late final HybridAIService _hybridService;
-  late final RagService _ragService;
 
-  AIStrategy _strategy = AIStrategy.cloudOnly;
-  bool _ragEnabled = false;
-  List<String> _lastRagSources = [];
+  bool _useLocal = false;
 
-  // Throttle setState during token streaming to avoid rebuilding on every token.
   DateTime _lastUiUpdate = DateTime.now();
   static const _uiUpdateInterval = Duration(milliseconds: 50);
 
@@ -45,12 +33,6 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     _cloudService = CloudAIService();
     _localService = LocalAIService();
-    _hybridService = HybridAIService(local: _localService, cloud: _cloudService);
-    // RagService shares LocalAIService's Genkit instance — no separate init needed.
-    _ragService = RagService(
-      ai: _localService.ai,
-      embedderName: _localService.embedderName,
-    );
     _initServices();
   }
 
@@ -58,75 +40,33 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       if (mounted) setState(() => _statusMessage = 'Connecting to cloud AI...');
       await _cloudService.initialize();
-      _cloudReady = true;
     } catch (e) {
-      debugPrint('Cloud service init failed: $e');
+      debugPrint('Cloud init failed: $e');
     }
 
     try {
       if (mounted) setState(() => _statusMessage = 'Downloading local model...');
       await _localService.initialize(
         onProgress: (progress) {
-          if (mounted) setState(() => _downloadProgress = progress);
+          if (mounted) {
+            setState(() =>
+                _statusMessage = 'Downloading model: ${(progress * 100).toInt()}%');
+          }
         },
       );
-      _localReady = true;
     } catch (e) {
-      debugPrint('Local service init failed: $e');
+      debugPrint('Local init failed: $e');
     }
 
-    if (_localReady) {
-      // RagService can only initialize after LocalAIService (needs its Genkit instance).
-      // Re-assign now that LocalAIService is initialized.
-      _ragService = RagService(
-        ai: _localService.ai,
-        embedderName: _localService.embedderName,
-      );
-      try {
-        if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
-        await _ragService.initialize(
-          onStatus: (status) {
-            if (mounted) setState(() => _statusMessage = status);
-          },
-        );
-        _ragReady = true;
-      } catch (e) {
-        debugPrint('RAG service init failed: $e');
-      }
-    }
-
-    if (!mounted) return;
-
-    final defaultStrategy = switch ((_cloudReady, _localReady)) {
-      (true, true) => AIStrategy.localFirst,
-      (false, true) => AIStrategy.localOnly,
-      (true, false) => AIStrategy.cloudOnly,
-      _ => AIStrategy.cloudOnly,
-    };
-
-    _hybridService.strategy = defaultStrategy;
-
-    final parts = [
-      if (_cloudReady) 'cloud',
-      if (_localReady) 'local',
-      if (_ragReady) 'RAG',
-    ];
-    final status =
-        parts.isEmpty ? 'No services available' : '${parts.join(', ')} ready';
-
-    setState(() {
-      _isInitializing = false;
-      _strategy = defaultStrategy;
-      _statusMessage = status;
-    });
+    if (mounted) setState(() => _isInitializing = false);
   }
 
   @override
   void dispose() {
     _controller.dispose();
     _scrollController.dispose();
-    _hybridService.dispose();
-    _ragService.dispose();
+    _cloudService.dispose();
+    _localService.dispose();
     super.dispose();
   }
 
@@ -152,34 +92,23 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.add(ChatMessage(text: text, isUser: true));
       _messages.add(ChatMessage(text: '', isUser: false));
       _isGenerating = true;
-      _lastRagSources = [];
     });
     _scrollToBottom();
 
     try {
-      String prompt = text;
-
-      if (_ragEnabled && _ragReady) {
-        final ragResult = await _ragService.searchAndBuildContext(text);
-        if (!mounted) return;
-        if (ragResult.hasContext) {
-          prompt = ragResult.augmentedPrompt;
-          setState(() => _lastRagSources = ragResult.sources);
-        }
-      }
-
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
 
-      await for (final chunk in _hybridService.generateResponseStream(prompt)) {
+      final service = _useLocal ? _localService : _cloudService;
+      await for (final chunk in service.generateResponseStream(text)) {
         buffer.write(chunk);
-
         final now = DateTime.now();
         if (now.difference(_lastUiUpdate) >= _uiUpdateInterval) {
           _lastUiUpdate = now;
           if (!mounted) return;
           setState(() {
-            _messages.last = ChatMessage(text: buffer.toString(), isUser: false);
+            _messages.last =
+                ChatMessage(text: buffer.toString(), isUser: false);
           });
           _scrollToBottom();
         }
@@ -199,7 +128,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         setState(() {
           _isGenerating = false;
-          // Clean up empty placeholder if stream was interrupted before yielding.
           if (_messages.isNotEmpty &&
               !_messages.last.isUser &&
               _messages.last.text.isEmpty) {
@@ -210,119 +138,53 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _onStrategyChanged(AIStrategy strategy) {
-    setState(() {
-      _strategy = strategy;
-      _hybridService.strategy = strategy;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('AI Chat'),
         centerTitle: true,
-        actions: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('RAG', style: TextStyle(fontSize: 12)),
-              Switch(
-                value: _ragEnabled,
-                onChanged: _ragReady
-                    ? (value) => setState(() => _ragEnabled = value)
-                    : null,
-              ),
-            ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(48),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                  value: false,
+                  label: Text('Cloud'),
+                  icon: Icon(Icons.cloud),
+                ),
+                ButtonSegment(
+                  value: true,
+                  label: Text('Local'),
+                  icon: Icon(Icons.phone_android),
+                ),
+              ],
+              selected: {_useLocal},
+              onSelectionChanged: (_isGenerating || _isInitializing)
+                  ? null
+                  : (s) => setState(() => _useLocal = s.first),
+            ),
           ),
-        ],
+        ),
       ),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: SegmentedButton<AIStrategy>(
-              segments: [
-                ButtonSegment(
-                  value: AIStrategy.cloudOnly,
-                  label: const Text('Cloud'),
-                  icon: const Icon(Icons.cloud),
-                  enabled: _cloudReady,
-                ),
-                ButtonSegment(
-                  value: AIStrategy.localOnly,
-                  label: const Text('Local'),
-                  icon: const Icon(Icons.phone_android),
-                  enabled: _localReady,
-                ),
-                ButtonSegment(
-                  value: AIStrategy.localFirst,
-                  label: const Text('Local+Cloud'),
-                  icon: const Icon(Icons.download_for_offline),
-                  enabled: _cloudReady && _localReady,
-                ),
-                ButtonSegment(
-                  value: AIStrategy.cloudFirst,
-                  label: const Text('Cloud+Local'),
-                  icon: const Icon(Icons.cloud_sync),
-                  enabled: _cloudReady && _localReady,
-                ),
-              ],
-              selected: {_strategy},
-              onSelectionChanged: (selected) =>
-                  _onStrategyChanged(selected.first),
-            ),
-          ),
-          if (_lastRagSources.isNotEmpty)
-            Container(
-              width: double.infinity,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              color: Theme.of(context).colorScheme.tertiaryContainer,
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.auto_awesome,
-                    size: 16,
-                    color: Theme.of(context).colorScheme.onTertiaryContainer,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Sources: ${_lastRagSources.join(', ')}',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Theme.of(context)
-                            .colorScheme
-                            .onTertiaryContainer,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
           if (_isInitializing)
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Text(_statusMessage),
-                  const SizedBox(height: 8),
-                  LinearProgressIndicator(
-                    value: _downloadProgress > 0 ? _downloadProgress : null,
-                  ),
-                ],
-              ),
+              child: Column(children: [
+                Text(_statusMessage),
+                const SizedBox(height: 8),
+                const LinearProgressIndicator(),
+              ]),
             ),
           Expanded(
             child: _messages.isEmpty
                 ? const Center(
-                    child: Text(
-                      'Send a message to start chatting',
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  )
+                    child: Text('Send a message to start chatting',
+                        style: TextStyle(color: Colors.grey)))
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.only(top: 8, bottom: 8),
@@ -334,27 +196,22 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_isGenerating)
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Row(
-                children: [
-                  SizedBox(
+              child: Row(children: [
+                SizedBox(
                     width: 16,
                     height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 8),
-                  Text('Generating...', style: TextStyle(color: Colors.grey)),
-                ],
-              ),
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 8),
+                Text('Generating...', style: TextStyle(color: Colors.grey)),
+              ]),
             ),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
               color: Theme.of(context).colorScheme.surface,
               border: Border(
-                top: BorderSide(
-                  color: Theme.of(context).colorScheme.outlineVariant,
-                ),
-              ),
+                  top: BorderSide(
+                      color: Theme.of(context).colorScheme.outlineVariant)),
             ),
             child: SafeArea(
               child: Row(
@@ -365,12 +222,10 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: const InputDecoration(
                         hintText: 'Type a message...',
                         border: OutlineInputBorder(
-                          borderRadius: BorderRadius.all(Radius.circular(24)),
-                        ),
+                            borderRadius:
+                                BorderRadius.all(Radius.circular(24))),
                         contentPadding: EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
-                        ),
+                            horizontal: 16, vertical: 10),
                       ),
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _sendMessage(),
