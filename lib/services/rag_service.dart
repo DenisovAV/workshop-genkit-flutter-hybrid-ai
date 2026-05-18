@@ -2,19 +2,8 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/services.dart';
-import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit_flutter_gemma/genkit_flutter_gemma.dart';
-
-const String _embeddingModelUrl =
-    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq256_mixed-precision.tflite';
-const String _tokenizerUrl =
-    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/sentencepiece.model';
-
-// Pass at build time: flutter run --dart-define=HF_TOKEN=hf_xxx
-const String _hfToken = String.fromEnvironment('HF_TOKEN');
-
-const String _embedderName = 'embedding-gemma-300m';
 
 const List<String> _cityFiles = [
   'paris',
@@ -43,33 +32,26 @@ class _VectorDocument {
   });
 }
 
+/// RAG service for tourist-guide semantic search.
+///
+/// Accepts a pre-initialized [Genkit] instance and embedder name from the
+/// caller so it stays decoupled from flutter_gemma lifecycle management.
+/// The caller (LocalAIService) owns model/embedder installation.
 class RagService {
-  Genkit? _ai;
+  final Genkit _ai;
+  final String _embedderName;
   final List<_VectorDocument> _store = [];
   bool _isInitialized = false;
 
   bool get isInitialized => _isInitialized;
   int get documentCount => _store.length;
 
-  Future<void> initialize({void Function(String status)? onStatus}) async {
-    onStatus?.call('Installing embedding model...');
-    await FlutterGemma.installEmbedder()
-        .modelFromNetwork(
-          _embeddingModelUrl,
-          token: _hfToken.isNotEmpty ? _hfToken : null,
-        )
-        .tokenizerFromNetwork(
-          _tokenizerUrl,
-          token: _hfToken.isNotEmpty ? _hfToken : null,
-        )
-        .install();
+  RagService({required Genkit ai, required String embedderName})
+      : _ai = ai,
+        _embedderName = embedderName;
 
-    _ai = Genkit(plugins: [
-      GenkitFlutterGemmaPlugin(
-        models: const [],
-        embedders: [FlutterGemmaEmbedderConfig(name: _embedderName)],
-      ),
-    ]);
+  Future<void> initialize({void Function(String status)? onStatus}) async {
+    if (_isInitialized) return;
 
     onStatus?.call('Loading tourist data...');
     await _loadTouristData(onStatus);
@@ -79,7 +61,6 @@ class RagService {
   }
 
   Future<void> _loadTouristData(void Function(String)? onStatus) async {
-    final ai = _ai!;
     for (final city in _cityFiles) {
       onStatus?.call('Embedding $city...');
       final jsonString =
@@ -89,7 +70,7 @@ class RagService {
       final name = data['name'] as String? ?? city;
       final content = _buildContent(data);
 
-      final embeddings = await ai.embed(
+      final embeddings = await _ai.embed(
         embedder: flutterGemma.embedder(_embedderName),
         document: DocumentData(content: [TextPart(text: content)]),
       );
@@ -119,7 +100,7 @@ class RagService {
   Future<RagResult> searchAndBuildContext(String query) async {
     if (!_isInitialized) throw StateError('RagService not initialized');
 
-    final queryEmbeddings = await _ai!.embed(
+    final queryEmbeddings = await _ai.embed(
       embedder: flutterGemma.embedder(_embedderName),
       document: DocumentData(content: [TextPart(text: query)]),
     );
@@ -134,13 +115,13 @@ class RagService {
     final topK = scored.take(3).toList();
 
     if (topK.isEmpty) {
-      return RagResult(augmentedPrompt: query, retrievedContext: '', sources: []);
+      return RagResult(
+          augmentedPrompt: query, retrievedContext: '', sources: []);
     }
 
     final context = topK.map((r) => r.doc.content).join('\n\n');
     final sources = topK
-        .map((r) =>
-            '${r.doc.city} (${(r.score * 100).toStringAsFixed(0)}%)')
+        .map((r) => '${r.doc.city} (${(r.score * 100).toStringAsFixed(0)}%)')
         .toList();
 
     final augmentedPrompt =
@@ -155,6 +136,8 @@ class RagService {
   }
 
   double _cosine(List<double> a, List<double> b) {
+    assert(a.length == b.length,
+        'Embedding dimensions must match: ${a.length} != ${b.length}');
     double dot = 0, normA = 0, normB = 0;
     for (int i = 0; i < a.length; i++) {
       dot += a[i] * b[i];
@@ -167,7 +150,6 @@ class RagService {
 
   Future<void> dispose() async {
     _store.clear();
-    _ai = null;
     _isInitialized = false;
   }
 }

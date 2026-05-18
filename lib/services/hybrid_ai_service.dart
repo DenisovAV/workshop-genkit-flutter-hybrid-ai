@@ -1,10 +1,14 @@
-import 'ai_service.dart';
 import 'cloud_ai_service.dart';
 import 'local_ai_service.dart';
 
 enum AIStrategy { localFirst, cloudFirst, localOnly, cloudOnly }
 
-class HybridAIService implements AIService {
+/// Routes generation requests between cloud and local AI services.
+///
+/// Expects both [local] and [cloud] to be independently initialized before
+/// calling [generateResponseStream]. The [strategy] must only be changed
+/// between requests, not during an active stream.
+class HybridAIService {
   final LocalAIService local;
   final CloudAIService cloud;
 
@@ -12,13 +16,6 @@ class HybridAIService implements AIService {
 
   HybridAIService({required this.local, required this.cloud});
 
-  @override
-  Future<void> initialize() async {
-    await cloud.initialize();
-    await local.initialize();
-  }
-
-  @override
   Stream<String> generateResponseStream(String prompt) async* {
     switch (strategy) {
       case AIStrategy.localFirst:
@@ -50,7 +47,6 @@ class HybridAIService implements AIService {
     }
   }
 
-  @override
   Future<void> dispose() async {
     await local.dispose();
     await cloud.dispose();

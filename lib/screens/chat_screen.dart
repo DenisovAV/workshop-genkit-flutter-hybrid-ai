@@ -23,13 +23,10 @@ class _ChatScreenState extends State<ChatScreen> {
   double _downloadProgress = 0;
   String _statusMessage = 'Initializing...';
 
-  // Per-service readiness flags — used to enable/disable UI segments.
   bool _cloudReady = false;
   bool _localReady = false;
   bool _ragReady = false;
 
-  // Services are assigned at the start of _initServices before any await,
-  // so late fields are always valid by the time the UI is interactive.
   late final CloudAIService _cloudService;
   late final LocalAIService _localService;
   late final HybridAIService _hybridService;
@@ -49,13 +46,15 @@ class _ChatScreenState extends State<ChatScreen> {
     _cloudService = CloudAIService();
     _localService = LocalAIService();
     _hybridService = HybridAIService(local: _localService, cloud: _cloudService);
-    _ragService = RagService();
+    // RagService shares LocalAIService's Genkit instance — no separate init needed.
+    _ragService = RagService(
+      ai: _localService.ai,
+      embedderName: _localService.embedderName,
+    );
     _initServices();
   }
 
   Future<void> _initServices() async {
-    // Initialize each service independently so a failure in one
-    // does not prevent others from starting.
     try {
       if (mounted) setState(() => _statusMessage = 'Connecting to cloud AI...');
       await _cloudService.initialize();
@@ -76,16 +75,24 @@ class _ChatScreenState extends State<ChatScreen> {
       debugPrint('Local service init failed: $e');
     }
 
-    try {
-      if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
-      await _ragService.initialize(
-        onStatus: (status) {
-          if (mounted) setState(() => _statusMessage = status);
-        },
+    if (_localReady) {
+      // RagService can only initialize after LocalAIService (needs its Genkit instance).
+      // Re-assign now that LocalAIService is initialized.
+      _ragService = RagService(
+        ai: _localService.ai,
+        embedderName: _localService.embedderName,
       );
-      _ragReady = true;
-    } catch (e) {
-      debugPrint('RAG service init failed: $e');
+      try {
+        if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
+        await _ragService.initialize(
+          onStatus: (status) {
+            if (mounted) setState(() => _statusMessage = status);
+          },
+        );
+        _ragReady = true;
+      } catch (e) {
+        debugPrint('RAG service init failed: $e');
+      }
     }
 
     if (!mounted) return;
@@ -104,9 +111,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_localReady) 'local',
       if (_ragReady) 'RAG',
     ];
-    final status = parts.isEmpty
-        ? 'No services available'
-        : '${parts.join(', ')} ready';
+    final status =
+        parts.isEmpty ? 'No services available' : '${parts.join(', ')} ready';
 
     setState(() {
       _isInitializing = false;
@@ -179,7 +185,6 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      // Render the final accumulated text after the stream ends.
       if (!mounted) return;
       setState(() {
         _messages.last = ChatMessage(text: buffer.toString(), isUser: false);
@@ -191,7 +196,17 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages.last = ChatMessage(text: 'Error: $e', isUser: false);
       });
     } finally {
-      if (mounted) setState(() => _isGenerating = false);
+      if (mounted) {
+        setState(() {
+          _isGenerating = false;
+          // Clean up empty placeholder if stream was interrupted before yielding.
+          if (_messages.isNotEmpty &&
+              !_messages.last.isUser &&
+              _messages.last.text.isEmpty) {
+            _messages.removeLast();
+          }
+        });
+      }
     }
   }
 
@@ -225,7 +240,6 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
-          // Strategy picker — segments disabled when the service isn't ready.
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             child: SegmentedButton<AIStrategy>(
@@ -256,13 +270,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ],
               selected: {_strategy},
-              onSelectionChanged: (selected) {
-                _onStrategyChanged(selected.first);
-              },
+              onSelectionChanged: (selected) =>
+                  _onStrategyChanged(selected.first),
             ),
           ),
-
-          // RAG sources banner
           if (_lastRagSources.isNotEmpty)
             Container(
               width: double.infinity,
@@ -274,8 +285,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   Icon(
                     Icons.auto_awesome,
                     size: 16,
-                    color:
-                        Theme.of(context).colorScheme.onTertiaryContainer,
+                    color: Theme.of(context).colorScheme.onTertiaryContainer,
                   ),
                   const SizedBox(width: 8),
                   Expanded(
@@ -292,8 +302,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
             ),
-
-          // Initialization progress
           if (_isInitializing)
             Padding(
               padding: const EdgeInsets.all(16),
@@ -307,8 +315,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
             ),
-
-          // Messages list
           Expanded(
             child: _messages.isEmpty
                 ? const Center(
@@ -321,13 +327,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     controller: _scrollController,
                     padding: const EdgeInsets.only(top: 8, bottom: 8),
                     itemCount: _messages.length,
-                    itemBuilder: (context, index) {
-                      return MessageBubble(message: _messages[index]);
-                    },
+                    itemBuilder: (context, index) =>
+                        MessageBubble(message: _messages[index]),
                   ),
           ),
-
-          // Generating indicator
           if (_isGenerating)
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -339,15 +342,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                   SizedBox(width: 8),
-                  Text(
-                    'Generating...',
-                    style: TextStyle(color: Colors.grey),
-                  ),
+                  Text('Generating...', style: TextStyle(color: Colors.grey)),
                 ],
               ),
             ),
-
-          // Input field
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
@@ -367,8 +365,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: const InputDecoration(
                         hintText: 'Type a message...',
                         border: OutlineInputBorder(
-                          borderRadius:
-                              BorderRadius.all(Radius.circular(24)),
+                          borderRadius: BorderRadius.all(Radius.circular(24)),
                         ),
                         contentPadding: EdgeInsets.symmetric(
                           horizontal: 16,
