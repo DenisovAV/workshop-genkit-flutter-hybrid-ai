@@ -1,5 +1,9 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:genkit/genkit.dart';
+import 'package:image_picker/image_picker.dart';
 import '../models/message_model.dart';
 import '../services/ai_engine.dart';
 import '../services/rag_service.dart';
@@ -32,6 +36,10 @@ class _ChatScreenState extends State<ChatScreen> {
   PolicyMode _policy = PolicyMode.cloud;
   bool _ragEnabled = false;
   List<String> _lastRagSources = [];
+
+  final _picker = ImagePicker();
+  Uint8List? _attachedImage;
+  String? _attachedMime;
 
   // Throttle setState during token streaming to avoid rebuilding on every token.
   DateTime _lastUiUpdate = DateTime.now();
@@ -120,14 +128,38 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  Future<void> _attachImage() async {
+    final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    if (!mounted) return;
+    setState(() {
+      _attachedImage = bytes;
+      _attachedMime = picked.mimeType ?? 'image/jpeg';
+    });
+  }
+
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isGenerating) return;
 
+    if (_attachedImage != null && _engine.requiresTextOnly(_policy)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "The on-device model can't see images — switch to Smart or Cloud.",
+          ),
+        ),
+      );
+      return;
+    }
+
     _controller.clear();
 
     setState(() {
-      _messages.add(ChatMessage(text: text, isUser: true));
+      _messages.add(
+        ChatMessage(text: text, isUser: true, imageBytes: _attachedImage),
+      );
       _messages.add(ChatMessage(text: '', isUser: false));
       _isGenerating = true;
       _lastRagSources = [];
@@ -146,10 +178,19 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      final userMessage = Message(
-        role: Role.user,
-        content: [TextPart(text: prompt)],
-      );
+      final content = <Part>[TextPart(text: prompt)];
+      if (_attachedImage != null) {
+        final mime = _attachedMime ?? 'image/jpeg';
+        final dataUri = 'data:$mime;base64,${base64Encode(_attachedImage!)}';
+        // contentType MUST be set: the on-device plugin drops media without an
+        // image/* contentType, and CapabilityStrategy reads it to detect vision.
+        content.add(
+          MediaPart(
+            media: Media(contentType: mime, url: dataUri),
+          ),
+        );
+      }
+      final userMessage = Message(role: Role.user, content: content);
 
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
@@ -191,6 +232,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         setState(() {
           _isGenerating = false;
+          _attachedImage = null;
+          _attachedMime = null;
           // Clean up empty placeholder if stream was interrupted before yielding.
           if (_messages.isNotEmpty &&
               !_messages.last.isUser &&
@@ -333,6 +376,33 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
             ),
+          if (_attachedImage != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: Row(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: Image.memory(
+                      _attachedImage!,
+                      width: 40,
+                      height: 40,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text('Image attached', style: TextStyle(fontSize: 12)),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed: () => setState(() {
+                      _attachedImage = null;
+                      _attachedMime = null;
+                    }),
+                  ),
+                ],
+              ),
+            ),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
@@ -362,6 +432,13 @@ class _ChatScreenState extends State<ChatScreen> {
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _sendMessage(),
                     ),
+                  ),
+                  IconButton(
+                    onPressed: (_isGenerating || _isInitializing)
+                        ? null
+                        : _attachImage,
+                    icon: const Icon(Icons.image_outlined),
+                    tooltip: 'Attach image',
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
