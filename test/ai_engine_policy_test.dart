@@ -69,4 +69,62 @@ void main() {
     expect(e.requiresTextOnly(PolicyMode.smart), isFalse);
     expect(e.requiresTextOnly(PolicyMode.cloud), isFalse);
   });
+
+  // --------------------------------------------------------------------
+  // End-to-end: modelFor -> ai.generate. This is the wiring `strategyFor`
+  // alone never exercises — `strategyFor(mode).route(ctx)` only returns a
+  // branch key, it never touches the registry. Before the fix, `modelFor`
+  // built a fresh, never-registered `hybridModel`/`cascadeModel` on every
+  // call; `ai.generate` reduces `model:` to `model.name` and looks it up via
+  // `registry.lookupAction('model', name)`, so every real send threw
+  // `GenkitException('Model <name> not found', NOT_FOUND)`. These tests fail
+  // against that code and pass once `modelFor` returns a model that was
+  // registered by `AiEngine`'s build+register path (see `AiEngine.forTest`).
+  group('modelFor -> ai.generate (registration wiring)', () {
+    Model fakeBranch(String name, String text) => Model(
+      name: name,
+      fn: (request, context) async => ModelResponse(
+        finishReason: FinishReason.stop,
+        message: Message(
+          role: Role.model,
+          content: [TextPart(text: text)],
+        ),
+      ),
+    );
+
+    test('cloud policy: modelFor is registered and routes to cloud', () async {
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: fakeBranch('flutter-gemma/local', 'LOCAL'),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      final resp = await ai.generate(
+        model: engine.modelFor(PolicyMode.cloud),
+        prompt: 'hi',
+      );
+
+      expect(resp.text, 'CLOUD');
+    });
+
+    test(
+      'local policy: modelFor is registered and routes to on-device',
+      () async {
+        final ai = Genkit(isDevEnv: false);
+        final engine = AiEngine.forTest(
+          ai: ai,
+          local: fakeBranch('flutter-gemma/local', 'LOCAL'),
+          cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+        );
+
+        final resp = await ai.generate(
+          model: engine.modelFor(PolicyMode.local),
+          prompt: 'hi',
+        );
+
+        expect(resp.text, 'LOCAL');
+      },
+    );
+  });
 }

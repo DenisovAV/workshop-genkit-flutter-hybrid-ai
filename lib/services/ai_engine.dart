@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit/plugin.dart' show GenkitPlugin;
@@ -32,6 +33,12 @@ class AiEngine {
   Model? _local;
   Model? _cloud;
 
+  /// One composite [Model] per policy, built AND registered once by
+  /// [_registerPolicyModels] — genkit reduces `generate(model: ...)` to the
+  /// model's name and looks it up in the registry, so a freshly built,
+  /// never-registered composite would fail every call with NOT_FOUND.
+  final Map<PolicyMode, Model> _models = {};
+
   bool cloudReady = false;
   bool localReady = false;
 
@@ -39,6 +46,23 @@ class AiEngine {
   int cloudCallsSpent = 0;
   int budgetCap = 3;
   bool get budgetAvailable => cloudCallsSpent < budgetCap;
+
+  AiEngine();
+
+  /// Test seam: skips [FlutterGemma.initialize]/`installModel` (real I/O that
+  /// can't run in a unit test) and takes already-resolved branch models
+  /// directly, then runs the same build+register path [initialize] uses — so
+  /// a test driving [modelFor] through `ai.generate` here exercises the real
+  /// registration wiring, not just [strategyFor].
+  @visibleForTesting
+  AiEngine.forTest({required Genkit ai, required Model local, Model? cloud}) {
+    _ai = ai;
+    _local = local;
+    _cloud = cloud;
+    localReady = true;
+    cloudReady = cloud != null;
+    _registerPolicyModels();
+  }
 
   Genkit get ai {
     final ai = _ai;
@@ -87,6 +111,8 @@ class AiEngine {
     _ai = Genkit(plugins: plugins);
     _local = await _resolve(flutterGemma.model(kLocalModel));
     if (cloudReady) _cloud = await _resolve(googleAI.gemini(kCloudModel));
+
+    _registerPolicyModels();
   }
 
   // A plugin model is registered by name; genkit's `Model` is an `Action`, so
@@ -104,9 +130,39 @@ class AiEngine {
     if (_cloud != null) kCloud: _cloud!,
   };
 
+  /// Builds AND registers one composite [Model] per [PolicyMode] whose
+  /// required branches are available, populating [_models]. A mode that needs
+  /// `kCloud` (every mode but `local`) is skipped when there's no API key, so
+  /// a missing cloud branch degrades to a clear [modelFor] error instead of
+  /// crashing here on a half-built `cascadeModel` (its `order` validates
+  /// eagerly against `branches`, unlike `hybridModel`).
+  void _registerPolicyModels() {
+    final branches = _branches;
+    for (final mode in PolicyMode.values) {
+      if (!_hasRequiredBranches(mode, branches)) continue;
+      final model = _buildModel(mode);
+      ai.registry.register(model);
+      _models[mode] = model;
+    }
+  }
+
+  bool _hasRequiredBranches(PolicyMode mode, Map<String, Model> branches) {
+    switch (mode) {
+      case PolicyMode.cloud:
+        return branches.containsKey(kCloud);
+      case PolicyMode.local:
+        return branches.containsKey(kOnDevice);
+      case PolicyMode.smart:
+      case PolicyMode.cascade:
+      case PolicyMode.budget:
+        return branches.containsKey(kOnDevice) && branches.containsKey(kCloud);
+    }
+  }
+
   /// The composable Genkit `Model` for [mode]. Cascade is a `cascadeModel`;
-  /// every other mode is `hybridModel(strategy: strategyFor(mode))`.
-  Model modelFor(PolicyMode mode) {
+  /// every other mode is `hybridModel(strategy: strategyFor(mode))`. Called
+  /// once per mode by [_registerPolicyModels] — not a per-request factory.
+  Model _buildModel(PolicyMode mode) {
     if (mode == PolicyMode.cascade) {
       return cascadeModel(
         branches: _branches,
@@ -122,9 +178,22 @@ class AiEngine {
     );
   }
 
+  /// The registered, resolvable `Model` for [mode] — built once by
+  /// [_registerPolicyModels] during [initialize] (or [AiEngine.forTest]).
+  Model modelFor(PolicyMode mode) {
+    final model = _models[mode];
+    if (model == null) {
+      throw StateError(
+        'No model registered for $mode — call initialize() first (or, if '
+        'this mode needs the cloud branch, make sure a cloud API key is set).',
+      );
+    }
+    return model;
+  }
+
   /// Pure policy → RoutingStrategy mapping (no models needed), so the routing
   /// decisions are unit-testable. [PolicyMode.cascade] has no strategy — it is
-  /// a Model, built in [modelFor].
+  /// a Model, built in [_buildModel].
   RoutingStrategy strategyFor(PolicyMode mode) {
     switch (mode) {
       case PolicyMode.cloud:
@@ -164,5 +233,6 @@ class AiEngine {
     _ai = null;
     _local = null;
     _cloud = null;
+    _models.clear();
   }
 }
