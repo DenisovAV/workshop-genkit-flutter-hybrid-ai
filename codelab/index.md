@@ -61,9 +61,11 @@ smart, cascade, budget.
 
 The key insight: `AiEngine` builds a single `Genkit` instance with both
 plugins registered, resolves the cloud and on-device models once, and hands
-them to `genkit_hybrid` as a `Map<String, Model>` of branches. The result —
-`engine.modelFor(policy)` — is itself an ordinary Genkit `Model`. The chat
-screen always calls the same
+them to `genkit_hybrid` as a `Map<String, Model>` of branches. For each
+`PolicyMode` it composes one branch map into an ordinary Genkit `Model` and
+registers it on `ai.registry` — once, during `initialize()`. `engine.modelFor(policy)`
+just returns that already-registered `Model`. The chat screen always calls
+the same
 `ai.generateStream(model: engine.modelFor(policy), messages: [...])`; only
 which `Model` `modelFor` returns changes with the policy.
 
@@ -433,6 +435,12 @@ class AiEngine {
   Model? _local;
   Model? _cloud;
 
+  /// One composite [Model] per policy, built AND registered once by
+  /// [_registerPolicyModels] — genkit reduces `generate(model: ...)` to the
+  /// model's name and looks it up in the registry, so a freshly built,
+  /// never-registered composite would fail every call with NOT_FOUND.
+  final Map<PolicyMode, Model> _models = {};
+
   bool cloudReady = false;
   bool localReady = false;
 
@@ -488,6 +496,11 @@ class AiEngine {
     _ai = Genkit(plugins: plugins);
     _local = await _resolve(flutterGemma.model(kLocalModel));
     if (cloudReady) _cloud = await _resolve(googleAI.gemini(kCloudModel));
+
+    // Build AND register every policy's composite model once, right here —
+    // not lazily inside modelFor. ai.generate(model: ...) resolves by name
+    // via the registry, so an unregistered composite throws NOT_FOUND.
+    _registerPolicyModels();
   }
 
   // A plugin model is registered by name; genkit's `Model` is an `Action`, so
@@ -505,9 +518,38 @@ class AiEngine {
     if (_cloud != null) kCloud: _cloud!,
   };
 
+  /// Builds AND registers one composite [Model] per [PolicyMode] whose
+  /// required branches are available. A mode that needs `kCloud` (every mode
+  /// but `local`) is skipped when there's no API key, instead of crashing on
+  /// a half-built `cascadeModel` (its `order` validates eagerly against
+  /// `branches`, unlike `hybridModel`).
+  void _registerPolicyModels() {
+    final branches = _branches;
+    for (final mode in PolicyMode.values) {
+      if (!_hasRequiredBranches(mode, branches)) continue;
+      final model = _buildModel(mode);
+      ai.registry.register(model);
+      _models[mode] = model;
+    }
+  }
+
+  bool _hasRequiredBranches(PolicyMode mode, Map<String, Model> branches) {
+    switch (mode) {
+      case PolicyMode.cloud:
+        return branches.containsKey(kCloud);
+      case PolicyMode.local:
+        return branches.containsKey(kOnDevice);
+      case PolicyMode.smart:
+      case PolicyMode.cascade:
+      case PolicyMode.budget:
+        return branches.containsKey(kOnDevice) && branches.containsKey(kCloud);
+    }
+  }
+
   /// The composable Genkit `Model` for [mode]. Cascade is a `cascadeModel`;
-  /// every other mode is `hybridModel(strategy: strategyFor(mode))`.
-  Model modelFor(PolicyMode mode) {
+  /// every other mode is `hybridModel(strategy: strategyFor(mode))`. Called
+  /// once per mode by [_registerPolicyModels] — not a per-request factory.
+  Model _buildModel(PolicyMode mode) {
     if (mode == PolicyMode.cascade) {
       return cascadeModel(
         branches: _branches,
@@ -523,9 +565,22 @@ class AiEngine {
     );
   }
 
+  /// The registered, resolvable `Model` for [mode] — built once by
+  /// [_registerPolicyModels] during [initialize].
+  Model modelFor(PolicyMode mode) {
+    final model = _models[mode];
+    if (model == null) {
+      throw StateError(
+        'No model registered for $mode — call initialize() first (or, if '
+        'this mode needs the cloud branch, make sure a cloud API key is set).',
+      );
+    }
+    return model;
+  }
+
   /// Pure policy → RoutingStrategy mapping (no models needed), so the routing
   /// decisions are unit-testable. [PolicyMode.cascade] has no strategy — it is
-  /// a Model, built in [modelFor].
+  /// a Model, built in [_buildModel].
   RoutingStrategy strategyFor(PolicyMode mode) {
     switch (mode) {
       case PolicyMode.cloud:
@@ -565,6 +620,7 @@ class AiEngine {
     _ai = null;
     _local = null;
     _cloud = null;
+    _models.clear();
   }
 }
 ```
@@ -577,7 +633,8 @@ For **Step 4** we only need `PolicyMode.cloud` and `PolicyMode.local`:
 `strategyFor` maps each straight to a `PreRoutingStrategy` that always
 returns one key. `smart`, `cascade`, and `budget` are covered in Step 4.5 —
 `strategyFor(PolicyMode.cascade)` deliberately throws, because cascade isn't
-a `RoutingStrategy` at all; `modelFor` builds it as a `cascadeModel` directly.
+a `RoutingStrategy` at all; `_buildModel` builds it as a `cascadeModel`
+directly.
 
 ### The hybrid is itself a Model
 
@@ -587,6 +644,16 @@ a `RoutingStrategy` at all; `modelFor` builds it as a `cascadeModel` directly.
 > with: streaming, a RAG-augmented prompt, images. `AiEngine.modelFor(mode)`
 > is a drop-in replacement for `googleAI.gemini(...)` or
 > `flutterGemma.model(...)`.
+>
+> **But an ordinary `Model` still has to be registered.** genkit resolves
+> `generate(model: ...)` (and `generateStream`) by reducing it to its `.name`
+> and looking that name up in `ai.registry` — a `Model` you built but never
+> registered fails every call with `NOT_FOUND`. That's why `initialize()`
+> calls `_registerPolicyModels()` right after resolving `_local`/`_cloud`:
+> it builds and registers all five policy composites *once*, up front, and
+> `modelFor` just returns the already-registered instance from `_models`.
+> Building a fresh `hybridModel`/`cascadeModel` inside `modelFor` itself —
+> without registering it — is the one thing to avoid here.
 
 ### Add the policy picker
 
@@ -777,7 +844,7 @@ case PolicyMode.budget:
   `WithFallback` then appends `kOnDevice` as a tail either way — that tail
   exists for a *transient* cloud failure (offline, timeout), not to hand the
   image to a model that can't see it.
-- **Cascade** — built in `modelFor`, not `strategyFor`:
+- **Cascade** — built in `_buildModel`, not `strategyFor`:
   `cascadeModel(branches: _branches, order: [kOnDevice, kCloud], accept: (r) => r.text.trim().length > 20)`.
   It tries the on-device model first; if the response passes `accept` (here,
   "longer than 20 characters") it's returned as-is, otherwise it escalates to
