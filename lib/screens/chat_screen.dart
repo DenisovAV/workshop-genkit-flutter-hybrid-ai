@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:genkit/genkit.dart';
 import '../models/message_model.dart';
-import '../services/cloud_ai_service.dart';
-import '../services/hybrid_ai_service.dart';
-import '../services/local_ai_service.dart';
+import '../services/ai_engine.dart';
 import '../services/rag_service.dart';
 import '../widgets/message_bubble.dart';
 
@@ -27,12 +26,10 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _localReady = false;
   bool _ragReady = false;
 
-  late final CloudAIService _cloudService;
-  late final LocalAIService _localService;
-  late final HybridAIService _hybridService;
-  late final RagService _ragService;
+  late final AiEngine _engine;
+  RagService? _ragService;
 
-  AIStrategy _strategy = AIStrategy.cloudOnly;
+  PolicyMode _policy = PolicyMode.cloud;
   bool _ragEnabled = false;
   List<String> _lastRagSources = [];
 
@@ -43,81 +40,62 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    _cloudService = CloudAIService();
-    _localService = LocalAIService();
-    _hybridService = HybridAIService(local: _localService, cloud: _cloudService);
-    // RagService shares LocalAIService's Genkit instance — no separate init needed.
-    _ragService = RagService(
-      ai: _localService.ai,
-      embedderName: _localService.embedderName,
-    );
+    _engine = AiEngine();
     _initServices();
   }
 
   Future<void> _initServices() async {
     try {
-      if (mounted) setState(() => _statusMessage = 'Connecting to cloud AI...');
-      await _cloudService.initialize();
-      _cloudReady = true;
-    } catch (e) {
-      debugPrint('Cloud service init failed: $e');
-    }
-
-    try {
-      if (mounted) setState(() => _statusMessage = 'Downloading local model...');
-      await _localService.initialize(
-        onProgress: (progress) {
-          if (mounted) setState(() => _downloadProgress = progress);
+      if (mounted)
+        setState(() => _statusMessage = 'Downloading local model...');
+      await _engine.initialize(
+        onProgress: (p) {
+          if (mounted) setState(() => _downloadProgress = p / 100);
         },
       );
-      _localReady = true;
     } catch (e) {
-      debugPrint('Local service init failed: $e');
+      debugPrint('AiEngine init failed: $e');
     }
 
+    _cloudReady = _engine.cloudReady;
+    _localReady = _engine.localReady;
+
     if (_localReady) {
-      // RagService can only initialize after LocalAIService (needs its Genkit instance).
-      // Re-assign now that LocalAIService is initialized.
-      _ragService = RagService(
-        ai: _localService.ai,
-        embedderName: _localService.embedderName,
-      );
       try {
         if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
-        await _ragService.initialize(
-          onStatus: (status) {
-            if (mounted) setState(() => _statusMessage = status);
+        final rag = RagService(
+          ai: _engine.ai,
+          embedderName: _engine.embedderName,
+        );
+        await rag.initialize(
+          onStatus: (s) {
+            if (mounted) setState(() => _statusMessage = s);
           },
         );
+        _ragService = rag;
         _ragReady = true;
       } catch (e) {
-        debugPrint('RAG service init failed: $e');
+        debugPrint('RAG init failed: $e');
       }
     }
 
     if (!mounted) return;
-
-    final defaultStrategy = switch ((_cloudReady, _localReady)) {
-      (true, true) => AIStrategy.localFirst,
-      (false, true) => AIStrategy.localOnly,
-      (true, false) => AIStrategy.cloudOnly,
-      _ => AIStrategy.cloudOnly,
+    final defaultPolicy = switch ((_cloudReady, _localReady)) {
+      (true, _) => PolicyMode.cloud,
+      (false, true) => PolicyMode.local,
+      _ => PolicyMode.cloud,
     };
-
-    _hybridService.strategy = defaultStrategy;
-
     final parts = [
       if (_cloudReady) 'cloud',
       if (_localReady) 'local',
       if (_ragReady) 'RAG',
     ];
-    final status =
-        parts.isEmpty ? 'No services available' : '${parts.join(', ')} ready';
-
     setState(() {
       _isInitializing = false;
-      _strategy = defaultStrategy;
-      _statusMessage = status;
+      _policy = defaultPolicy;
+      _statusMessage = parts.isEmpty
+          ? 'No services available'
+          : '${parts.join(', ')} ready';
     });
   }
 
@@ -125,8 +103,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _controller.dispose();
     _scrollController.dispose();
-    _hybridService.dispose();
-    _ragService.dispose();
+    _engine.dispose();
+    _ragService?.dispose();
     super.dispose();
   }
 
@@ -160,7 +138,7 @@ class _ChatScreenState extends State<ChatScreen> {
       String prompt = text;
 
       if (_ragEnabled && _ragReady) {
-        final ragResult = await _ragService.searchAndBuildContext(text);
+        final ragResult = await _ragService!.searchAndBuildContext(text);
         if (!mounted) return;
         if (ragResult.hasContext) {
           prompt = ragResult.augmentedPrompt;
@@ -168,21 +146,35 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
 
+      final userMessage = Message(
+        role: Role.user,
+        content: [TextPart(text: prompt)],
+      );
+
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
 
-      await for (final chunk in _hybridService.generateResponseStream(prompt)) {
-        buffer.write(chunk);
-
+      final stream = _engine.ai.generateStream(
+        model: _engine.modelFor(_policy),
+        messages: [userMessage],
+      );
+      await for (final chunk in stream) {
+        buffer.write(chunk.text);
         final now = DateTime.now();
         if (now.difference(_lastUiUpdate) >= _uiUpdateInterval) {
           _lastUiUpdate = now;
           if (!mounted) return;
           setState(() {
-            _messages.last = ChatMessage(text: buffer.toString(), isUser: false);
+            _messages.last = ChatMessage(
+              text: buffer.toString(),
+              isUser: false,
+            );
           });
           _scrollToBottom();
         }
+      }
+      if (_policy == PolicyMode.budget || _policy == PolicyMode.cloud) {
+        _engine.cloudCallsSpent++; // demo accounting for CostStrategy
       }
 
       if (!mounted) return;
@@ -210,13 +202,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _onStrategyChanged(AIStrategy strategy) {
-    setState(() {
-      _strategy = strategy;
-      _hybridService.strategy = strategy;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -242,43 +227,45 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: SegmentedButton<AIStrategy>(
-              segments: [
-                ButtonSegment(
-                  value: AIStrategy.cloudOnly,
-                  label: const Text('Cloud'),
-                  icon: const Icon(Icons.cloud),
+            child: DropdownButton<PolicyMode>(
+              value: _policy,
+              isExpanded: true,
+              items: [
+                DropdownMenuItem(
+                  value: PolicyMode.cloud,
                   enabled: _cloudReady,
+                  child: const Text('Cloud'),
                 ),
-                ButtonSegment(
-                  value: AIStrategy.localOnly,
-                  label: const Text('Local'),
-                  icon: const Icon(Icons.phone_android),
+                DropdownMenuItem(
+                  value: PolicyMode.local,
                   enabled: _localReady,
+                  child: const Text('Local'),
                 ),
-                ButtonSegment(
-                  value: AIStrategy.localFirst,
-                  label: const Text('Local+Cloud'),
-                  icon: const Icon(Icons.download_for_offline),
+                DropdownMenuItem(
+                  value: PolicyMode.smart,
                   enabled: _cloudReady && _localReady,
+                  child: const Text('Smart (image-aware)'),
                 ),
-                ButtonSegment(
-                  value: AIStrategy.cloudFirst,
-                  label: const Text('Cloud+Local'),
-                  icon: const Icon(Icons.cloud_sync),
+                DropdownMenuItem(
+                  value: PolicyMode.cascade,
                   enabled: _cloudReady && _localReady,
+                  child: const Text('Cascade (escalate on quality)'),
+                ),
+                DropdownMenuItem(
+                  value: PolicyMode.budget,
+                  enabled: _cloudReady && _localReady,
+                  child: const Text('Budget (cost-gated)'),
                 ),
               ],
-              selected: {_strategy},
-              onSelectionChanged: (selected) =>
-                  _onStrategyChanged(selected.first),
+              onChanged: (m) {
+                if (m != null) setState(() => _policy = m);
+              },
             ),
           ),
           if (_lastRagSources.isNotEmpty)
             Container(
               width: double.infinity,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               color: Theme.of(context).colorScheme.tertiaryContainer,
               child: Row(
                 children: [
@@ -293,9 +280,9 @@ class _ChatScreenState extends State<ChatScreen> {
                       'Sources: ${_lastRagSources.join(', ')}',
                       style: TextStyle(
                         fontSize: 12,
-                        color: Theme.of(context)
-                            .colorScheme
-                            .onTertiaryContainer,
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.onTertiaryContainer,
                       ),
                     ),
                   ),
