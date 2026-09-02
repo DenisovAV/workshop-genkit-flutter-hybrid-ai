@@ -16,15 +16,19 @@ A Flutter chat application that progressively integrates AI capabilities using G
 
 1. **Cloud Chat** — Streaming responses from Gemini via `genkit_google_genai`
 2. **Local Inference** — On-device AI with Gemma 3 1B via `genkit_flutter_gemma`
-3. **Hybrid Strategy** — Automatic fallback between cloud and local
-4. **Embeddings** — Semantic vector representations with EmbeddingGemma via Genkit
-5. **RAG** — Context-augmented generation using a local tourist guide
+3. **Hybrid Strategy** — Cloud/local routing via `genkit_hybrid` (fallback, capability, cascade, budget)
+4. **Smart Routing & Images** — multimodal input and image-aware policy routing
+5. **Embeddings** — Semantic vector representations with EmbeddingGemma via Genkit
+6. **RAG** — Context-augmented generation using a local tourist guide
 
 ### What you'll learn
 
 - How to use the Genkit Dart framework for AI inference in Flutter
-- How to route between cloud and on-device models using a single `Genkit` instance
+- How to route between cloud and on-device models using a single `Genkit`
+  instance and `genkit_hybrid`'s routing strategies
 - How to run AI models locally on device with `genkit_flutter_gemma`
+- How to send images to a vision-capable model and gate routing on model
+  capabilities
 - How text embeddings work and how to build a RAG pipeline with Genkit
 
 ### What you'll need
@@ -41,22 +45,27 @@ A Flutter chat application that progressively integrates AI capabilities using G
 ┌──────────────────────────────────────────┐
 │              Flutter App                 │
 ├──────────────────────────────────────────┤
-│           HybridAIService                │
+│                AiEngine                  │
+│          one Genkit, two plugins         │
 ├──────────────────┬───────────────────────┤
-│  CloudAIService  │    LocalAIService     │
-│  Genkit instance │    Genkit instance    │
-│  googleAI plugin │ GenkitFlutterGemma    │
-│                  │       plugin          │
-├──────────────────┼───────────────────────┤
-│  gemini-2.5-     │  Gemma 3 1B           │
-│  flash (cloud)   │  + EmbeddingGemma     │
-│                  │  (on-device)          │
+│  googleAI plugin │  GenkitFlutterGemma   │
+│  gemini-2.5-flash│  Gemma 3 1B +         │
+│     (kCloud)     │  EmbeddingGemma       │
+│                  │    (kOnDevice)        │
 └──────────────────┴───────────────────────┘
 ```
 
-The key insight: both cloud and on-device inference use the same Genkit API —
-`ai.generateStream(model: ..., prompt: ...)`. The only thing that changes is
-the `model:` parameter.
+`genkit_hybrid` composes both branches into one routable `Model` —
+`hybridModel()` / `cascadeModel()` — selected by a `PolicyMode`: cloud, local,
+smart, cascade, budget.
+
+The key insight: `AiEngine` builds a single `Genkit` instance with both
+plugins registered, resolves the cloud and on-device models once, and hands
+them to `genkit_hybrid` as a `Map<String, Model>` of branches. The result —
+`engine.modelFor(policy)` — is itself an ordinary Genkit `Model`. The chat
+screen always calls the same
+`ai.generateStream(model: engine.modelFor(policy), messages: [...])`; only
+which `Model` `modelFor` returns changes with the policy.
 
 ## Step 1: Starter Project
 Duration: 5
@@ -341,89 +350,500 @@ ai.generateStream(model: flutterGemma.model('gemma-3-1b-it'), prompt: prompt)
 
 Same API. Different backends.
 
+> **Coming up**: In Step 4 we retire `CloudAIService` and `LocalAIService` as
+> separate classes. A single `AiEngine` builds one `Genkit` with both plugins
+> registered, and `genkit_hybrid` composes the two resolved models into one
+> routable `Model` — the app still calls `ai.generateStream(model: ..., ...)`,
+> it just gets that one `Model` from `AiEngine` instead of picking a service.
+
 ## Step 4: Hybrid Strategy
 Duration: 15
 
-### Create HybridAIService
+### Update dependencies
 
-Create `lib/services/hybrid_ai_service.dart`:
+Bump the existing Genkit packages to the 0.15.1 line (`genkit_hybrid` needs
+it) and add `genkit_hybrid` itself:
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # Cloud AI via Gemini API (Genkit)
+  genkit: ^0.15.1
+  genkit_google_genai: ^0.2.12
+
+  # On-device AI via genkit_flutter_gemma
+  genkit_flutter_gemma: ^0.5.0
+  flutter_gemma: ^1.7.0
+
+  # Hybrid on-device ↔ cloud routing
+  genkit_hybrid: ^0.2.0
+```
+
+Run `flutter pub get`.
+
+### Retire CloudAIService, LocalAIService, HybridAIService
+
+```bash
+git rm lib/services/ai_service.dart lib/services/cloud_ai_service.dart \
+       lib/services/local_ai_service.dart lib/services/hybrid_ai_service.dart
+```
+
+They're replaced by one `AiEngine` that owns a single `Genkit` instance for
+both plugins.
+
+### Create AiEngine
+
+Create `lib/services/ai_engine.dart`:
 
 ```dart
-import 'ai_service.dart';
-import 'cloud_ai_service.dart';
-import 'local_ai_service.dart';
+import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:genkit/genkit.dart';
+import 'package:genkit/plugin.dart' show GenkitPlugin;
+import 'package:genkit_flutter_gemma/genkit_flutter_gemma.dart';
+import 'package:genkit_google_genai/genkit_google_genai.dart';
+import 'package:genkit_hybrid/genkit_hybrid.dart';
 
-enum AIStrategy { localFirst, cloudFirst, localOnly, cloudOnly }
+const _modelUrl =
+    'https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task';
+const _embeddingModelUrl =
+    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq256_mixed-precision.tflite';
+const _tokenizerUrl =
+    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/sentencepiece.model';
 
-class HybridAIService implements AIService {
-  final LocalAIService local;
-  final CloudAIService cloud;
+// Pass at build time: --dart-define=HF_TOKEN=hf_xxx --dart-define=GEMINI_API_KEY=AIza...
+const _hfToken = String.fromEnvironment('HF_TOKEN');
+const _geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
 
-  AIStrategy strategy = AIStrategy.localFirst;
+const kLocalModel = 'gemma-3-1b-it';
+const kCloudModel = 'gemini-2.5-flash';
+const kEmbedder = 'embedding-gemma-300m';
 
-  HybridAIService({required this.local, required this.cloud});
+/// The five routing policies the chat exposes. Each maps to one genkit_hybrid
+/// construct (see [modelFor] / [strategyFor]).
+enum PolicyMode { cloud, local, smart, cascade, budget }
 
-  @override
-  Future<void> initialize() async {
-    await cloud.initialize();
-    await local.initialize();
+/// Owns a single Genkit instance with both plugins (cloud + on-device),
+/// resolves the two base models, and composes them via genkit_hybrid per the
+/// selected [PolicyMode]. Replaces the old Cloud/Local/HybridAIService trio.
+class AiEngine {
+  Genkit? _ai;
+  Model? _local;
+  Model? _cloud;
+
+  bool cloudReady = false;
+  bool localReady = false;
+
+  // CostStrategy demo signal: the app counts cloud calls against a small cap.
+  int cloudCallsSpent = 0;
+  int budgetCap = 3;
+  bool get budgetAvailable => cloudCallsSpent < budgetCap;
+
+  Genkit get ai {
+    final ai = _ai;
+    if (ai == null) throw StateError('AiEngine not initialized');
+    return ai;
   }
 
-  @override
-  Stream<String> generateResponseStream(String prompt) async* {
-    switch (strategy) {
-      case AIStrategy.localFirst:
-        var yielded = false;
-        try {
-          await for (final chunk in local.generateResponseStream(prompt)) {
-            yielded = true;
-            yield chunk;
-          }
-        } catch (e) {
-          if (yielded) rethrow; // don't silently switch mid-response
-          yield* cloud.generateResponseStream(prompt);
-        }
-      case AIStrategy.cloudFirst:
-        var yielded = false;
-        try {
-          await for (final chunk in cloud.generateResponseStream(prompt)) {
-            yielded = true;
-            yield chunk;
-          }
-        } catch (e) {
-          if (yielded) rethrow;
-          yield* local.generateResponseStream(prompt);
-        }
-      case AIStrategy.localOnly:
-        yield* local.generateResponseStream(prompt);
-      case AIStrategy.cloudOnly:
-        yield* cloud.generateResponseStream(prompt);
+  String get embedderName => kEmbedder;
+
+  Future<void> initialize({void Function(int progress)? onProgress}) async {
+    final plugins = <GenkitPlugin>[];
+
+    if (_geminiApiKey.isNotEmpty) {
+      plugins.add(googleAI(apiKey: _geminiApiKey));
+      cloudReady = true;
+    }
+
+    await FlutterGemma.initialize();
+    await FlutterGemma.installModel(modelType: ModelType.gemmaIt)
+        .fromNetwork(_modelUrl, token: _hfToken.isEmpty ? null : _hfToken)
+        .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+        .install();
+    await FlutterGemma.installEmbedder()
+        .modelFromNetwork(
+          _embeddingModelUrl,
+          token: _hfToken.isEmpty ? null : _hfToken,
+        )
+        .tokenizerFromNetwork(
+          _tokenizerUrl,
+          token: _hfToken.isEmpty ? null : _hfToken,
+        )
+        .install();
+    plugins.add(
+      GenkitFlutterGemmaPlugin(
+        models: [
+          FlutterGemmaModelConfig(
+            name: kLocalModel,
+            modelType: ModelType.gemmaIt,
+          ),
+        ],
+        embedders: [FlutterGemmaEmbedderConfig(name: kEmbedder)],
+      ),
+    );
+    localReady = true;
+
+    _ai = Genkit(plugins: plugins);
+    _local = await _resolve(flutterGemma.model(kLocalModel));
+    if (cloudReady) _cloud = await _resolve(googleAI.gemini(kCloudModel));
+  }
+
+  // A plugin model is registered by name; genkit's `Model` is an `Action`, so
+  // look the concrete model up from the registry and cast.
+  Future<Model> _resolve(ModelRef ref) async {
+    final action = await ai.registry.lookupAction('model', ref.name);
+    if (action == null) {
+      throw StateError('model "${ref.name}" is not registered');
+    }
+    return action as Model;
+  }
+
+  Map<String, Model> get _branches => {
+    if (_local != null) kOnDevice: _local!,
+    if (_cloud != null) kCloud: _cloud!,
+  };
+
+  /// The composable Genkit `Model` for [mode]. Cascade is a `cascadeModel`;
+  /// every other mode is `hybridModel(strategy: strategyFor(mode))`.
+  Model modelFor(PolicyMode mode) {
+    if (mode == PolicyMode.cascade) {
+      return cascadeModel(
+        branches: _branches,
+        order: const [kOnDevice, kCloud],
+        accept: (r) => r.text.trim().length > 20,
+        name: 'cascade',
+      );
+    }
+    return hybridModel(
+      branches: _branches,
+      strategy: strategyFor(mode),
+      name: mode.name,
+    );
+  }
+
+  /// Pure policy → RoutingStrategy mapping (no models needed), so the routing
+  /// decisions are unit-testable. [PolicyMode.cascade] has no strategy — it is
+  /// a Model, built in [modelFor].
+  RoutingStrategy strategyFor(PolicyMode mode) {
+    switch (mode) {
+      case PolicyMode.cloud:
+        return PreRoutingStrategy((_) => kCloud);
+      case PolicyMode.local:
+        return PreRoutingStrategy((_) => kOnDevice);
+      case PolicyMode.smart:
+        // Image → cloud (only it declares vision). Text → cloud-first (kCloud
+        // listed first), on-device as the transient-failure fallback (an
+        // offline cloud call throws → hybridModel falls to on-device).
+        return WithFallback(
+          CapabilityStrategy(
+            supports: {
+              kCloud: {ModelCapability.vision},
+              kOnDevice: <ModelCapability>{},
+            },
+          ),
+          fallbackOrder: const [kOnDevice],
+        );
+      case PolicyMode.budget:
+        return CostStrategy(
+          budgetAvailable: () => budgetAvailable,
+          premium: kCloud,
+          cheap: kOnDevice,
+        );
+      case PolicyMode.cascade:
+        throw ArgumentError('cascade has no RoutingStrategy; use modelFor');
     }
   }
 
-  @override
+  /// True when [mode]'s primary route starts on the text-only on-device model,
+  /// so an attached image cannot be handled (used to block send with a hint).
+  bool requiresTextOnly(PolicyMode mode) =>
+      mode == PolicyMode.local || mode == PolicyMode.cascade;
+
   Future<void> dispose() async {
-    await local.dispose();
-    await cloud.dispose();
+    _ai = null;
+    _local = null;
+    _cloud = null;
   }
 }
 ```
 
-### Add strategy picker to the UI
+`kOnDevice` and `kCloud` are branch-key constants exported by `genkit_hybrid`
+itself — reuse them instead of inventing your own strings so every strategy
+agrees on the same keys.
 
-In `chat_screen.dart`, add a `SegmentedButton<AIStrategy>` with four options:
-Cloud Only, Local Only, Local→Cloud, Cloud→Local.
+For **Step 4** we only need `PolicyMode.cloud` and `PolicyMode.local`:
+`strategyFor` maps each straight to a `PreRoutingStrategy` that always
+returns one key. `smart`, `cascade`, and `budget` are covered in Step 4.5 —
+`strategyFor(PolicyMode.cascade)` deliberately throws, because cascade isn't
+a `RoutingStrategy` at all; `modelFor` builds it as a `cascadeModel` directly.
 
-### Test the fallback
+### The hybrid is itself a Model
 
-1. Switch to **Local→Cloud**
-2. Disable WiFi
-3. Send a message — the local model responds
-4. Re-enable WiFi — cloud responds again
+> **The punchline**: `hybridModel()` (and `cascadeModel()`) return an
+> ordinary Genkit `Model`. Nothing downstream needs to know routing
+> happened — the result composes with everything a normal model composes
+> with: streaming, a RAG-augmented prompt, images. `AiEngine.modelFor(mode)`
+> is a drop-in replacement for `googleAI.gemini(...)` or
+> `flutterGemma.model(...)`.
 
-> **Notice**: `HybridAIService` doesn't know anything about Genkit. It routes
-> between two `AIService` implementations. Genkit lives _inside_ each service.
-> The routing logic — `switch (strategy)` with `yield*` — is pure Dart.
+### Add the policy picker
+
+In `chat_screen.dart`, replace the strategy toggle with a `DropdownButton`
+over all five `PolicyMode` values (options are disabled until their
+prerequisite is ready — `smart`/`cascade`/`budget` need both cloud and local):
+
+```dart
+Padding(
+  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+  child: DropdownButton<PolicyMode>(
+    value: _policy,
+    isExpanded: true,
+    items: [
+      DropdownMenuItem(
+        value: PolicyMode.cloud,
+        enabled: _cloudReady,
+        child: const Text('Cloud'),
+      ),
+      DropdownMenuItem(
+        value: PolicyMode.local,
+        enabled: _localReady,
+        child: const Text('Local'),
+      ),
+      DropdownMenuItem(
+        value: PolicyMode.smart,
+        enabled: _cloudReady && _localReady,
+        child: const Text('Smart (image-aware)'),
+      ),
+      DropdownMenuItem(
+        value: PolicyMode.cascade,
+        enabled: _cloudReady && _localReady,
+        child: const Text('Cascade (escalate on quality)'),
+      ),
+      DropdownMenuItem(
+        value: PolicyMode.budget,
+        enabled: _cloudReady && _localReady,
+        child: const Text('Budget (cost-gated)'),
+      ),
+    ],
+    onChanged: (m) {
+      if (m != null) setState(() => _policy = m);
+    },
+  ),
+),
+```
+
+### Drive generateStream from modelFor
+
+`_sendMessage()` no longer picks between two services — it always calls the
+same `Genkit`, and lets `AiEngine.modelFor(_policy)` decide who answers:
+
+```dart
+final userMessage = Message(
+  role: Role.user,
+  content: [TextPart(text: prompt)],
+);
+
+final stream = _engine.ai.generateStream(
+  model: _engine.modelFor(_policy),
+  messages: [userMessage],
+);
+await for (final chunk in stream) {
+  buffer.write(chunk.text);
+  // ... same throttled setState loop as Step 2/3
+}
+if (_policy == PolicyMode.budget || _policy == PolicyMode.cloud) {
+  _engine.cloudCallsSpent++; // demo accounting for CostStrategy
+}
+```
+
+`prompt` here is still `text` unless RAG rewrote it — that wiring is
+unchanged and lands for real in Step 6.
+
+### Test it
+
+1. Switch to **Cloud** and send a message — Gemini answers.
+2. Switch to **Local** and send a message — Gemma 3 1B answers.
+3. Leave **Smart**, **Cascade**, and **Budget** for Step 4.5 — right now
+   `strategyFor` treats them correctly, but nothing exercises their
+   interesting behavior (an image, a bad on-device answer, a spent budget)
+   until then.
+
+## Step 4.5: Smart routing & images
+Duration: 20
+
+Three of the five `PolicyMode` values only get interesting once the app can
+send more than plain text, and once there's a signal to route on besides "the
+user picked cloud or local." This step adds image input, wires it through
+`CapabilityStrategy`, and walks through what `smart`, `cascade`, and `budget`
+actually decide.
+
+### Update dependencies
+
+```yaml
+  # Image input (multimodal)
+  image_picker: ^1.2.3
+```
+
+Run `flutter pub get`.
+
+### Attach an image
+
+In `chat_screen.dart`, add the picker and its state:
+
+```dart
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:image_picker/image_picker.dart';
+
+// in _ChatScreenState:
+final _picker = ImagePicker();
+Uint8List? _attachedImage;
+String? _attachedMime;
+
+Future<void> _attachImage() async {
+  final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+  if (picked == null) return;
+  final bytes = await picked.readAsBytes();
+  if (!mounted) return;
+  setState(() {
+    _attachedImage = bytes;
+    _attachedMime = picked.mimeType ?? 'image/jpeg';
+  });
+}
+```
+
+Add an `IconButton(icon: const Icon(Icons.image_outlined))` next to the send
+button that calls `_attachImage`, and a small thumbnail preview (`Image.memory`
++ a close button) shown above the input row while `_attachedImage != null`.
+
+### Build a multimodal message
+
+`_sendMessage()` now builds a `content` list instead of a single `TextPart`:
+
+```dart
+final content = <Part>[TextPart(text: prompt)];
+if (_attachedImage != null) {
+  final mime = _attachedMime ?? 'image/jpeg';
+  final dataUri = 'data:$mime;base64,${base64Encode(_attachedImage!)}';
+  // contentType MUST be set: the on-device plugin drops media without an
+  // image/* contentType, and CapabilityStrategy reads it to detect vision.
+  content.add(
+    MediaPart(
+      media: Media(contentType: mime, url: dataUri),
+    ),
+  );
+}
+final userMessage = Message(role: Role.user, content: content);
+```
+
+`contentType` is the load-bearing detail: `CapabilityStrategy` (below) only
+recognizes a `MediaPart` as vision when its `Media.contentType` starts with
+`image/` — an `image_picker` file with no MIME type falls back to
+`'image/jpeg'` so it's never silently dropped.
+
+### Smart, Cascade, and Budget
+
+Back in `AiEngine.strategyFor`, the three remaining cases:
+
+```dart
+case PolicyMode.smart:
+  // Image → cloud (only it declares vision). Text → cloud-first (kCloud
+  // listed first), on-device as the transient-failure fallback (an
+  // offline cloud call throws → hybridModel falls to on-device).
+  return WithFallback(
+    CapabilityStrategy(
+      supports: {
+        kCloud: {ModelCapability.vision},
+        kOnDevice: <ModelCapability>{},
+      },
+    ),
+    fallbackOrder: const [kOnDevice],
+  );
+case PolicyMode.budget:
+  return CostStrategy(
+    budgetAvailable: () => budgetAvailable,
+    premium: kCloud,
+    cheap: kOnDevice,
+  );
+```
+
+- **Smart** — `CapabilityStrategy` inspects the outgoing `ModelRequest` for
+  media parts. A text-only request has no required capability, so both
+  branches qualify and it returns `[kCloud, kOnDevice]` (cloud-first, in
+  `supports`' insertion order). An image request requires `vision`, which
+  only `kCloud` declares, so `CapabilityStrategy` alone returns `[kCloud]`.
+  `WithFallback` then appends `kOnDevice` as a tail either way — that tail
+  exists for a *transient* cloud failure (offline, timeout), not to hand the
+  image to a model that can't see it.
+- **Cascade** — built in `modelFor`, not `strategyFor`:
+  `cascadeModel(branches: _branches, order: [kOnDevice, kCloud], accept: (r) => r.text.trim().length > 20)`.
+  It tries the on-device model first; if the response passes `accept` (here,
+  "longer than 20 characters") it's returned as-is, otherwise it escalates to
+  cloud. `cascadeModel` is **non-streaming internally** — even through
+  `ai.generateStream`, a cascade-routed request buffers the whole winning
+  response and emits it as a single chunk.
+- **Budget** — `CostStrategy` returns `[premium, cheap]` while
+  `budgetAvailable()` is true, `[cheap]` once it isn't. `AiEngine` owns the
+  budget itself: `cloudCallsSpent` is a plain int the app increments after
+  every `cloud`/`budget` call (see the `_sendMessage` snippet above) and
+  compares against `budgetCap` (3 by default). `genkit_hybrid` has no billing
+  SDK — it only ever sees the resulting `bool`.
+
+### The capability block
+
+An image can't reach a policy whose primary route is the text-only on-device
+model. `AiEngine.requiresTextOnly` flags that:
+
+```dart
+bool requiresTextOnly(PolicyMode mode) =>
+    mode == PolicyMode.local || mode == PolicyMode.cascade;
+```
+
+`_sendMessage()` checks it before doing anything else:
+
+```dart
+if (_attachedImage != null && _engine.requiresTextOnly(_policy)) {
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(
+      content: Text(
+        "The on-device model can't see images — switch to Smart or Cloud.",
+      ),
+    ),
+  );
+  return;
+}
+```
+
+`local` always starts on-device; `cascade`'s first hop is always on-device
+too — both are blocked. `smart` and `cloud` always keep `kCloud` reachable
+(as the primary route or the `WithFallback` tail), so they're let through.
+`budget` is let through as well, but that's the one optimistic case: once
+`cloudCallsSpent` hits `budgetCap`, `CostStrategy` routes to `[kOnDevice]`
+only — `requiresTextOnly` checks the policy, not its current spend, so an
+image sent on a spent budget still isn't guaranteed a vision-capable branch.
+
+### Manual runbook
+
+1. Send a text message in each of the five modes — Cloud, Local, Smart,
+   Cascade, Budget — and confirm each one answers.
+2. Attach an image, switch to **Smart**, and send — the response comes from
+   Gemini (`CapabilityStrategy` routes the vision request straight to
+   `kCloud`).
+3. Turn off WiFi, stay on **Smart**, and send a text message — the cloud
+   attempt fails transiently and `WithFallback` reroutes to the on-device
+   model (slower, but it answers).
+4. Turn WiFi back on, switch to **Budget**, and send 3 text messages (the
+   default `budgetCap`) — the 4th switches routing to on-device only
+   (`CostStrategy` sees `budgetAvailable == false`).
+5. Switch to **Local** and attach an image — send is blocked before any
+   request goes out, with the "can't see images" snackbar.
+
+`flutter test test/ai_engine_policy_test.dart` exercises the same
+`strategyFor`/`requiresTextOnly` decisions as a fast, deviceless unit test —
+useful to rerun after touching routing logic instead of redoing the whole
+runbook by hand.
 
 ## Step 5: Embeddings with Genkit
 Duration: 20
@@ -487,6 +907,25 @@ for (final city in _cityFiles) {
 ## Step 6: RAG — Retrieval-Augmented Generation
 Duration: 20
 
+### Wire RagService to AiEngine
+
+`RagService` doesn't manage its own `Genkit` instance or model installation —
+it takes both from `AiEngine`, the same way `_sendMessage` does:
+
+```dart
+final rag = RagService(
+  ai: _engine.ai,
+  embedderName: _engine.embedderName,
+);
+await rag.initialize(
+  onStatus: (s) {
+    if (mounted) setState(() => _statusMessage = s);
+  },
+);
+_ragService = rag;
+_ragReady = true;
+```
+
 ### Semantic search
 
 When the user sends a query, embed it and find the closest city documents
@@ -549,7 +988,8 @@ Duration: 10
 |------------|-----------|
 | Cloud inference | `genkit_google_genai` → Gemini 2.5 Flash |
 | On-device inference | `genkit_flutter_gemma` → Gemma 3 1B |
-| Hybrid routing | `HybridAIService` + 4 strategies |
+| Hybrid routing | `genkit_hybrid` — `hybridModel`/`cascadeModel` (cloud, local, smart, cascade, budget) |
+| Multimodal input | `image_picker` + `MediaPart`, routed by `CapabilityStrategy` |
 | On-device embeddings | `genkit_flutter_gemma` → EmbeddingGemma 300M |
 | RAG pipeline | Genkit `embed()` + in-memory cosine search |
 
@@ -563,6 +1003,9 @@ cloud and raw flutter_gemma calls for local. With Genkit:
 ai.generateStream(model: googleAI.gemini('gemini-2.5-flash'), prompt: prompt)
 ai.generateStream(model: flutterGemma.model('gemma-3-1b-it'), prompt: prompt)
 ai.embed(embedder: flutterGemma.embedder('embedding-gemma-300m'), document: ...)
+
+// genkit_hybrid composes both into one routable model — still the same call:
+ai.generateStream(model: engine.modelFor(policy), messages: [userMessage])
 ```
 
 Routing, fallback, observability, and tool calling all work the same way
@@ -582,6 +1025,7 @@ regardless of which model backend you use.
 ### Resources
 
 - [genkit_flutter_gemma on pub.dev](https://pub.dev/packages/genkit_flutter_gemma)
+- [genkit_hybrid on pub.dev](https://pub.dev/packages/genkit_hybrid)
 - [genkit on pub.dev](https://pub.dev/packages/genkit)
 - [genkit_google_genai on pub.dev](https://pub.dev/packages/genkit_google_genai)
 - [flutter_gemma on pub.dev](https://pub.dev/packages/flutter_gemma)
