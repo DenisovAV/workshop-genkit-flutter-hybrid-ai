@@ -834,9 +834,13 @@ image sent on a spent budget still isn't guaranteed a vision-capable branch.
 3. Turn off WiFi, stay on **Smart**, and send a text message — the cloud
    attempt fails transiently and `WithFallback` reroutes to the on-device
    model (slower, but it answers).
-4. Turn WiFi back on, switch to **Budget**, and send 3 text messages (the
-   default `budgetCap`) — the 4th switches routing to on-device only
-   (`CostStrategy` sees `budgetAvailable == false`).
+4. Turn WiFi back on, switch to **Budget**, and keep sending text messages.
+   `cloudCallsSpent` counts every completed Cloud- or Budget-mode call
+   cumulatively for the whole session — including the Cloud-mode message
+   from step 1 — so it may already be close to `budgetCap` (3) by the time
+   you get here. Once it reaches the cap, routing flips to on-device only
+   (`CostStrategy` sees `budgetAvailable == false`); a hot restart resets
+   the counter to 0 if you want to watch it flip from a clean count.
 5. Switch to **Local** and attach an image — send is blocked before any
    request goes out, with the "can't see images" snackbar.
 
