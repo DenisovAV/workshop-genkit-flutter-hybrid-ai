@@ -1,5 +1,6 @@
 import 'package:genkit/genkit.dart';
 import 'package:genkit_google_genai/genkit_google_genai.dart';
+
 import 'ai_service.dart';
 
 // Pass at build time: flutter run --dart-define=GEMINI_API_KEY=AIza...
@@ -25,7 +26,7 @@ class CloudAIService implements AIService {
     if (ai == null) throw StateError('CloudAIService not initialized');
 
     final stream = ai.generateStream(
-      model: googleAI.gemini('gemini-2.5-flash'),
+      model: googleAI.gemini('gemini-3.7-flash'),
       prompt: prompt,
     );
 
