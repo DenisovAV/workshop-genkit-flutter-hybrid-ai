@@ -33,7 +33,7 @@ A Flutter chat application that progressively integrates AI capabilities using G
 
 ### What you'll need
 
-- Flutter 3.27+ installed
+- Flutter 3.47.2 (latest stable) installed
 - A GEMINI_API_KEY from [aistudio.google.com](https://aistudio.google.com)
 - A HuggingFace account (for model downloads)
 - Android device/emulator, iOS simulator, or macOS
@@ -127,8 +127,8 @@ Google account, and click **Get API key**. Copy the key — you'll use it with
 
 > No Firebase project, no CLI setup — just an API key.
 
-> **Model choice**: this workshop pins `gemini-3.7-flash` — `gemini-2.5-flash`
-> is slated to sunset around October 2026.
+> **Model choice**: this workshop pins `gemini-3.7-flash` — the older
+> `gemini-2.5-flash` is being phased out.
 
 ### Update dependencies
 
@@ -1138,7 +1138,7 @@ regardless of which model backend you use.
 
 - **Production embeddings**: Persist the vector store with SQLite + `drift` so
   you don't re-embed on every cold start
-- **More models**: Swap `gemini-3.7-flash` for `gemini-2.5-pro` for complex
+- **More models**: Swap `gemini-3.7-flash` for `gemini-3.7-pro` for complex
   queries, or add a second on-device model for specialized tasks
 - **Genkit flows**: Wrap the hybrid routing in a `defineFlow` to add
   observability, retries, and structured output
