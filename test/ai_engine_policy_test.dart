@@ -61,21 +61,15 @@ void main() {
     () {
       // The inner CapabilityStrategy excludes the text-only on-device model when
       // an image is present; WithFallback then appends it as the safety tail.
+      // NOTE: this only checks that smart routes cloud-first for an image
+      // request. `AiEngine.strategyFor` returns a composed `RoutingStrategy`
+      // with no observable way to assert per-modality capability detection
+      // in isolation — the real image guard is `requiresTextOnly`, which has
+      // its own test below.
       final route = AiEngine()
           .strategyFor(PolicyMode.smart)
           .route(_ctx(withImage: true));
       expect(route.first, kCloud);
-
-      // Prove this is capability detection, not just fallback ordering: the
-      // inner CapabilityStrategy alone (no WithFallback safety tail) must
-      // exclude the text-only on-device branch entirely for an image request.
-      final capability = CapabilityStrategy(
-        supports: {
-          kCloud: {ModelCapability.vision},
-          kOnDevice: <ModelCapability>{},
-        },
-      );
-      expect(capability.route(_ctx(withImage: true)), [kCloud]);
     },
   );
 
@@ -217,6 +211,51 @@ void main() {
         expect(engine.modelFor(PolicyMode.local), isNotNull);
         expect(
           () => engine.modelFor(PolicyMode.cloud),
+          throwsA(isA<StateError>()),
+        );
+        expect(
+          () => engine.modelFor(PolicyMode.smart),
+          throwsA(isA<StateError>()),
+        );
+        expect(
+          () => engine.modelFor(PolicyMode.cascade),
+          throwsA(isA<StateError>()),
+        );
+        expect(
+          () => engine.modelFor(PolicyMode.budget),
+          throwsA(isA<StateError>()),
+        );
+      },
+    );
+  });
+
+  // --------------------------------------------------------------------
+  // Local-absent guard: symmetric mirror of the cloud-absent guard above —
+  // this is the unit-level proxy for item 2's cloud/local decoupling. If the
+  // on-device engine bootstrap ever throws again before Genkit is built,
+  // cloud must still resolve and work; here that's modeled directly via
+  // `AiEngine.forTest(local: null)` (the same nullable seam `forTest` and
+  // `initialize` now share).
+  group('local-absent guard', () {
+    test(
+      'cloud works without a local branch; every local-needing policy throws',
+      () async {
+        final ai = Genkit(isDevEnv: false);
+        final engine = AiEngine.forTest(
+          ai: ai,
+          cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+        );
+
+        expect(engine.localReady, isFalse);
+
+        final resp = await ai.generate(
+          model: engine.modelFor(PolicyMode.cloud),
+          prompt: 'hi',
+        );
+        expect(resp.text, 'CLOUD');
+
+        expect(
+          () => engine.modelFor(PolicyMode.local),
           throwsA(isA<StateError>()),
         );
         expect(
