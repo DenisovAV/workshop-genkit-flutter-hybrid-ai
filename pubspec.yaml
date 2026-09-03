@@ -19,6 +19,9 @@ dependencies:
   # On-device AI via genkit_flutter_gemma
   genkit_flutter_gemma: ^0.5.0
   flutter_gemma: ^1.7.0
+  # LiteRT-LM engine (.litertlm inference) + LiteRT embedding backend —
+  # flutter_gemma 1.x registers no engines by default; opt in here.
+  flutter_gemma_litertlm: ^1.6.1
 
   # Hybrid on-device ↔ cloud routing
   genkit_hybrid: ^0.2.0
@@ -28,6 +31,8 @@ dependencies:
 
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
   flutter_lints: ^6.0.0
 

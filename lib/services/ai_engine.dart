@@ -1,13 +1,16 @@
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit/plugin.dart' show GenkitPlugin;
 import 'package:genkit_flutter_gemma/genkit_flutter_gemma.dart';
 import 'package:genkit_google_genai/genkit_google_genai.dart';
 import 'package:genkit_hybrid/genkit_hybrid.dart';
 
-const _modelUrl =
-    'https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task';
+// Prod installs the on-device LLM straight from Hugging Face by repo + file
+// (the plugin applies the configured token to gated huggingface.co URLs).
+const _hfRepo = 'litert-community/Gemma3-1B-IT';
+const _hfModelFile = 'Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm';
 const _embeddingModelUrl =
     'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq256_mixed-precision.tflite';
 const _tokenizerUrl =
@@ -18,7 +21,7 @@ const _hfToken = String.fromEnvironment('HF_TOKEN');
 const _geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
 
 const kLocalModel = 'gemma-3-1b-it';
-const kCloudModel = 'gemini-2.5-flash';
+const kCloudModel = 'gemini-3.7-flash';
 const kEmbedder = 'embedding-gemma-300m';
 
 /// The five routing policies the chat exposes. Each maps to one genkit_hybrid
@@ -72,7 +75,14 @@ class AiEngine {
 
   String get embedderName => kEmbedder;
 
-  Future<void> initialize({void Function(int progress)? onProgress}) async {
+  Future<void> initialize({
+    void Function(int progress)? onProgress,
+    // Test seam: install the LLM from a pre-staged local file instead of
+    // downloading it — avoids a flaky ~500MB on-device download on CI / FTL.
+    String? localModelPath,
+    // Test seam: skip the embedder download when RAG isn't exercised.
+    bool downloadEmbedder = true,
+  }) async {
     final plugins = <GenkitPlugin>[];
 
     if (_geminiApiKey.isNotEmpty) {
@@ -80,30 +90,56 @@ class AiEngine {
       cloudReady = true;
     }
 
-    await FlutterGemma.initialize();
-    await FlutterGemma.installModel(modelType: ModelType.gemmaIt)
-        .fromNetwork(_modelUrl, token: _hfToken.isEmpty ? null : _hfToken)
-        .withProgress((p) => onProgress?.call(p)) // p is int 0..100
-        .install();
-    await FlutterGemma.installEmbedder()
-        .modelFromNetwork(
-          _embeddingModelUrl,
-          token: _hfToken.isEmpty ? null : _hfToken,
-        )
-        .tokenizerFromNetwork(
-          _tokenizerUrl,
-          token: _hfToken.isEmpty ? null : _hfToken,
-        )
-        .install();
+    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
+    // (.litertlm inference) + its LiteRT embedding backend.
+    await FlutterGemma.initialize(
+      inferenceEngines: [LiteRtLmEngine()],
+      embeddingBackends: [LiteRtEmbeddingBackend()],
+    );
+
+    // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
+    // which no registered engine would handle here.
+    final llm = FlutterGemma.installModel(
+      modelType: ModelType.gemmaIt,
+      fileType: ModelFileType.litertlm,
+    );
+    if (localModelPath != null) {
+      await llm.fromFile(localModelPath).install();
+    } else {
+      await llm
+          .fromHuggingFace(
+            _hfRepo,
+            file: _hfModelFile,
+            token: _hfToken.isEmpty ? null : _hfToken,
+          )
+          .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+          .install();
+    }
+
+    if (downloadEmbedder) {
+      await FlutterGemma.installEmbedder()
+          .modelFromNetwork(
+            _embeddingModelUrl,
+            token: _hfToken.isEmpty ? null : _hfToken,
+          )
+          .tokenizerFromNetwork(
+            _tokenizerUrl,
+            token: _hfToken.isEmpty ? null : _hfToken,
+          )
+          .install();
+    }
     plugins.add(
       GenkitFlutterGemmaPlugin(
         models: [
           FlutterGemmaModelConfig(
             name: kLocalModel,
             modelType: ModelType.gemmaIt,
+            fileType: ModelFileType.litertlm,
           ),
         ],
-        embedders: [FlutterGemmaEmbedderConfig(name: kEmbedder)],
+        embedders: downloadEmbedder
+            ? [FlutterGemmaEmbedderConfig(name: kEmbedder)]
+            : const [],
       ),
     );
     localReady = true;
