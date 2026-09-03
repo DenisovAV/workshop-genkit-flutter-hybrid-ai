@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:genkit/genkit.dart';
+
 import '../models/message_model.dart';
 import '../services/ai_engine.dart';
 import '../widgets/message_bubble.dart';
@@ -104,6 +105,7 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _scrollToBottom();
 
+    var generationSucceeded = false;
     try {
       final userMessage = Message(
         role: Role.user,
@@ -112,6 +114,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
+
+      // Captured before the call: genkit_hybrid doesn't report which branch
+      // actually ran, so this is a best-effort demo counter, not an exact
+      // count of cloud calls — see the accounting comment below.
+      final wasBudgetAvailable = _engine.budgetAvailable;
 
       final stream = _engine.ai.generateStream(
         model: _engine.modelFor(_policy),
@@ -132,13 +139,25 @@ class _ChatScreenState extends State<ChatScreen> {
           _scrollToBottom();
         }
       }
-      if (_policy == PolicyMode.budget || _policy == PolicyMode.cloud) {
-        _engine.cloudCallsSpent++; // demo accounting for CostStrategy
+      generationSucceeded = true;
+
+      // Best-effort demo counter for CostStrategy: genkit_hybrid exposes no
+      // "which branch ran" signal, so a Budget call that transiently fell
+      // back to on-device still counts here as spent; Budget stops climbing
+      // once the cap is hit either way.
+      if (_policy == PolicyMode.cloud) {
+        _engine.cloudCallsSpent++;
+      } else if (_policy == PolicyMode.budget && wasBudgetAvailable) {
+        _engine.cloudCallsSpent++;
       }
 
       if (!mounted) return;
+      final responseText = buffer.toString();
       setState(() {
-        _messages.last = ChatMessage(text: buffer.toString(), isUser: false);
+        _messages.last = ChatMessage(
+          text: responseText.isEmpty ? '(no response)' : responseText,
+          isUser: false,
+        );
       });
       _scrollToBottom();
     } catch (e) {
@@ -150,8 +169,12 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         setState(() {
           _isGenerating = false;
-          // Clean up empty placeholder if stream was interrupted before yielding.
-          if (_messages.isNotEmpty &&
+          // Clean up the placeholder only when generation neither succeeded
+          // nor errored (e.g. interrupted before either branch above ran) —
+          // a successful-but-empty response is shown as '(no response)'
+          // above instead of silently vanishing here.
+          if (!generationSucceeded &&
+              _messages.isNotEmpty &&
               !_messages.last.isUser &&
               _messages.last.text.isEmpty) {
             _messages.removeLast();
