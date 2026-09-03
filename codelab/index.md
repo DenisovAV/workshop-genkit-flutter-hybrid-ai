@@ -49,7 +49,7 @@ A Flutter chat application that progressively integrates AI capabilities using G
 │          one Genkit, two plugins         │
 ├──────────────────┬───────────────────────┤
 │  googleAI plugin │  GenkitFlutterGemma   │
-│  gemini-2.5-flash│  Gemma 3 1B +         │
+│  gemini-3.7-flash│  Gemma 3 1B +         │
 │     (kCloud)     │  EmbeddingGemma       │
 │                  │    (kOnDevice)        │
 └──────────────────┴───────────────────────┘
@@ -127,6 +127,9 @@ Google account, and click **Get API key**. Copy the key — you'll use it with
 
 > No Firebase project, no CLI setup — just an API key.
 
+> **Model choice**: this workshop pins `gemini-3.7-flash` — `gemini-2.5-flash`
+> is slated to sunset around October 2026.
+
 ### Update dependencies
 
 In `pubspec.yaml`, uncomment the Genkit dependencies:
@@ -174,7 +177,7 @@ class CloudAIService implements AIService {
     if (ai == null) throw StateError('CloudAIService not initialized');
 
     final stream = ai.generateStream(
-      model: googleAI.gemini('gemini-2.5-flash'),
+      model: googleAI.gemini('gemini-3.7-flash'),
       prompt: prompt,
     );
 
@@ -221,7 +224,7 @@ flutter run --dart-define=GEMINI_API_KEY=your_key_here
 Type "Tell me about Paris" — Gemini streams a response token by token.
 
 > **What happened?** `Genkit(plugins: [googleAI(...)])` registered Gemini as a
-> model provider. `ai.generateStream(model: googleAI.gemini('gemini-2.5-flash'), ...)`
+> model provider. `ai.generateStream(model: googleAI.gemini('gemini-3.7-flash'), ...)`
 > streams the response. The `Genkit` instance is the single point of contact
 > for all AI operations.
 
@@ -344,7 +347,7 @@ The first run downloads ~600 MB. Subsequent runs use the cached model.
 
 ```dart
 // Cloud:
-ai.generateStream(model: googleAI.gemini('gemini-2.5-flash'), prompt: prompt)
+ai.generateStream(model: googleAI.gemini('gemini-3.7-flash'), prompt: prompt)
 
 // Local:
 ai.generateStream(model: flutterGemma.model('gemma-3-1b-it'), prompt: prompt)
@@ -364,7 +367,8 @@ Duration: 15
 ### Update dependencies
 
 Bump the existing Genkit packages to the 0.15.1 line (`genkit_hybrid` needs
-it) and add `genkit_hybrid` itself:
+it), add `genkit_hybrid` itself, and add `flutter_gemma_litertlm` — the
+LiteRT-LM inference engine (see below for why it's now required):
 
 ```yaml
 dependencies:
@@ -379,12 +383,41 @@ dependencies:
   # On-device AI via genkit_flutter_gemma
   genkit_flutter_gemma: ^0.5.0
   flutter_gemma: ^1.7.0
+  # LiteRT-LM engine (.litertlm inference) + LiteRT embedding backend —
+  # flutter_gemma 1.x registers no engines by default; opt in here.
+  flutter_gemma_litertlm: ^1.6.1
 
   # Hybrid on-device ↔ cloud routing
   genkit_hybrid: ^0.2.0
 ```
 
 Run `flutter pub get`.
+
+### flutter_gemma 1.x ships no engine by default
+
+Step 3 got a working on-device model out of a bare `FlutterGemma.initialize()`
+on `flutter_gemma: ^0.15.1`. Starting at `flutter_gemma: ^1.7.0` that call
+registers **no** inference engine and **no** embedding backend by default —
+core only owns the registry and the install plumbing; every runtime is now an
+opt-in sibling package. This workshop opts into LiteRT-LM
+(`flutter_gemma_litertlm`, `.litertlm` model files) for both the LLM and the
+embedder:
+
+```dart
+await FlutterGemma.initialize(
+  inferenceEngines: [LiteRtLmEngine()],
+  embeddingBackends: [LiteRtEmbeddingBackend()],
+);
+```
+
+That also changes which model file gets installed. `installModel(...)`
+defaults `fileType` to `ModelFileType.task` (MediaPipe) — with no MediaPipe
+engine registered here, `.litertlm` must be declared explicitly via
+`fileType: ModelFileType.litertlm`, and the install source becomes a
+`.litertlm` file (via `fromHuggingFace`) instead of the `.task` file Step 3
+downloaded with `fromNetwork`. `FlutterGemmaModelConfig` needs the same
+`fileType: ModelFileType.litertlm` so `genkit_flutter_gemma` resolves the
+model against the right runtime.
 
 ### Retire CloudAIService, LocalAIService, HybridAIService
 
@@ -402,14 +435,17 @@ Create `lib/services/ai_engine.dart`:
 
 ```dart
 import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit/plugin.dart' show GenkitPlugin;
 import 'package:genkit_flutter_gemma/genkit_flutter_gemma.dart';
 import 'package:genkit_google_genai/genkit_google_genai.dart';
 import 'package:genkit_hybrid/genkit_hybrid.dart';
 
-const _modelUrl =
-    'https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task';
+// The on-device LLM installs straight from Hugging Face by repo + file (the
+// plugin applies the configured token to gated huggingface.co URLs).
+const _hfRepo = 'litert-community/Gemma3-1B-IT';
+const _hfModelFile = 'Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm';
 const _embeddingModelUrl =
     'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq256_mixed-precision.tflite';
 const _tokenizerUrl =
@@ -420,7 +456,7 @@ const _hfToken = String.fromEnvironment('HF_TOKEN');
 const _geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
 
 const kLocalModel = 'gemma-3-1b-it';
-const kCloudModel = 'gemini-2.5-flash';
+const kCloudModel = 'gemini-3.7-flash';
 const kEmbedder = 'embedding-gemma-300m';
 
 /// The five routing policies the chat exposes. Each maps to one genkit_hybrid
@@ -465,9 +501,24 @@ class AiEngine {
       cloudReady = true;
     }
 
-    await FlutterGemma.initialize();
-    await FlutterGemma.installModel(modelType: ModelType.gemmaIt)
-        .fromNetwork(_modelUrl, token: _hfToken.isEmpty ? null : _hfToken)
+    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
+    // (.litertlm inference) + its LiteRT embedding backend.
+    await FlutterGemma.initialize(
+      inferenceEngines: [LiteRtLmEngine()],
+      embeddingBackends: [LiteRtEmbeddingBackend()],
+    );
+
+    // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
+    // which no registered engine would handle here.
+    await FlutterGemma.installModel(
+      modelType: ModelType.gemmaIt,
+      fileType: ModelFileType.litertlm,
+    )
+        .fromHuggingFace(
+          _hfRepo,
+          file: _hfModelFile,
+          token: _hfToken.isEmpty ? null : _hfToken,
+        )
         .withProgress((p) => onProgress?.call(p)) // p is int 0..100
         .install();
     await FlutterGemma.installEmbedder()
@@ -486,6 +537,7 @@ class AiEngine {
           FlutterGemmaModelConfig(
             name: kLocalModel,
             modelType: ModelType.gemmaIt,
+            fileType: ModelFileType.litertlm,
           ),
         ],
         embedders: [FlutterGemmaEmbedderConfig(name: kEmbedder)],
@@ -1057,7 +1109,7 @@ Duration: 10
 
 | Capability | Technology |
 |------------|-----------|
-| Cloud inference | `genkit_google_genai` → Gemini 2.5 Flash |
+| Cloud inference | `genkit_google_genai` → Gemini 3.7 Flash |
 | On-device inference | `genkit_flutter_gemma` → Gemma 3 1B |
 | Hybrid routing | `genkit_hybrid` — `hybridModel`/`cascadeModel` (cloud, local, smart, cascade, budget) |
 | Multimodal input | `image_picker` + `MediaPart`, routed by `CapabilityStrategy` |
@@ -1071,7 +1123,7 @@ cloud and raw flutter_gemma calls for local. With Genkit:
 
 ```dart
 // Both use the same API — only model: changes
-ai.generateStream(model: googleAI.gemini('gemini-2.5-flash'), prompt: prompt)
+ai.generateStream(model: googleAI.gemini('gemini-3.7-flash'), prompt: prompt)
 ai.generateStream(model: flutterGemma.model('gemma-3-1b-it'), prompt: prompt)
 ai.embed(embedder: flutterGemma.embedder('embedding-gemma-300m'), document: ...)
 
@@ -1086,7 +1138,7 @@ regardless of which model backend you use.
 
 - **Production embeddings**: Persist the vector store with SQLite + `drift` so
   you don't re-embed on every cold start
-- **More models**: Swap `gemini-2.5-flash` for `gemini-2.5-pro` for complex
+- **More models**: Swap `gemini-3.7-flash` for `gemini-2.5-pro` for complex
   queries, or add a second on-device model for specialized tasks
 - **Genkit flows**: Wrap the hybrid routing in a `defineFlow` to add
   observability, retries, and structured output
