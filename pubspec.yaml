@@ -26,9 +26,6 @@ dependencies:
   # Hybrid on-device ↔ cloud routing
   genkit_hybrid: ^0.2.0
 
-  # Image input (multimodal)
-  image_picker: ^1.2.3
-
 dev_dependencies:
   flutter_test:
     sdk: flutter

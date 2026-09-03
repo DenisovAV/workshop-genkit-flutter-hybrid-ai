@@ -1,12 +1,7 @@
-import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
 import 'package:genkit/genkit.dart';
-import 'package:image_picker/image_picker.dart';
 import '../models/message_model.dart';
 import '../services/ai_engine.dart';
-import '../services/rag_service.dart';
 import '../widgets/message_bubble.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -28,18 +23,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _cloudReady = false;
   bool _localReady = false;
-  bool _ragReady = false;
 
   late final AiEngine _engine;
-  RagService? _ragService;
 
   PolicyMode _policy = PolicyMode.cloud;
-  bool _ragEnabled = false;
-  List<String> _lastRagSources = [];
-
-  final _picker = ImagePicker();
-  Uint8List? _attachedImage;
-  String? _attachedMime;
 
   // Throttle setState during token streaming to avoid rebuilding on every token.
   DateTime _lastUiUpdate = DateTime.now();
@@ -68,36 +55,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _cloudReady = _engine.cloudReady;
     _localReady = _engine.localReady;
 
-    if (_localReady) {
-      try {
-        if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
-        final rag = RagService(
-          ai: _engine.ai,
-          embedderName: _engine.embedderName,
-        );
-        await rag.initialize(
-          onStatus: (s) {
-            if (mounted) setState(() => _statusMessage = s);
-          },
-        );
-        _ragService = rag;
-        _ragReady = true;
-      } catch (e) {
-        debugPrint('RAG init failed: $e');
-      }
-    }
-
     if (!mounted) return;
     final defaultPolicy = switch ((_cloudReady, _localReady)) {
       (true, _) => PolicyMode.cloud,
       (false, true) => PolicyMode.local,
       _ => PolicyMode.cloud,
     };
-    final parts = [
-      if (_cloudReady) 'cloud',
-      if (_localReady) 'local',
-      if (_ragReady) 'RAG',
-    ];
+    final parts = [if (_cloudReady) 'cloud', if (_localReady) 'local'];
     setState(() {
       _isInitializing = false;
       _policy = defaultPolicy;
@@ -112,7 +76,6 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.dispose();
     _scrollController.dispose();
     _engine.dispose();
-    _ragService?.dispose();
     super.dispose();
   }
 
@@ -128,69 +91,24 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _attachImage() async {
-    final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
-    if (picked == null) return;
-    final bytes = await picked.readAsBytes();
-    if (!mounted) return;
-    setState(() {
-      _attachedImage = bytes;
-      _attachedMime = picked.mimeType ?? 'image/jpeg';
-    });
-  }
-
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isGenerating) return;
 
-    if (_attachedImage != null && _engine.requiresTextOnly(_policy)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "The on-device model can't see images — switch to Smart or Cloud.",
-          ),
-        ),
-      );
-      return;
-    }
-
     _controller.clear();
 
     setState(() {
-      _messages.add(
-        ChatMessage(text: text, isUser: true, imageBytes: _attachedImage),
-      );
+      _messages.add(ChatMessage(text: text, isUser: true));
       _messages.add(ChatMessage(text: '', isUser: false));
       _isGenerating = true;
-      _lastRagSources = [];
     });
     _scrollToBottom();
 
     try {
-      String prompt = text;
-
-      if (_ragEnabled && _ragReady) {
-        final ragResult = await _ragService!.searchAndBuildContext(text);
-        if (!mounted) return;
-        if (ragResult.hasContext) {
-          prompt = ragResult.augmentedPrompt;
-          setState(() => _lastRagSources = ragResult.sources);
-        }
-      }
-
-      final content = <Part>[TextPart(text: prompt)];
-      if (_attachedImage != null) {
-        final mime = _attachedMime ?? 'image/jpeg';
-        final dataUri = 'data:$mime;base64,${base64Encode(_attachedImage!)}';
-        // contentType MUST be set: the on-device plugin drops media without an
-        // image/* contentType, and CapabilityStrategy reads it to detect vision.
-        content.add(
-          MediaPart(
-            media: Media(contentType: mime, url: dataUri),
-          ),
-        );
-      }
-      final userMessage = Message(role: Role.user, content: content);
+      final userMessage = Message(
+        role: Role.user,
+        content: [TextPart(text: text)],
+      );
 
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
@@ -232,8 +150,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         setState(() {
           _isGenerating = false;
-          _attachedImage = null;
-          _attachedMime = null;
           // Clean up empty placeholder if stream was interrupted before yielding.
           if (_messages.isNotEmpty &&
               !_messages.last.isUser &&
@@ -248,24 +164,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('AI Chat'),
-        centerTitle: true,
-        actions: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('RAG', style: TextStyle(fontSize: 12)),
-              Switch(
-                value: _ragEnabled,
-                onChanged: _ragReady
-                    ? (value) => setState(() => _ragEnabled = value)
-                    : null,
-              ),
-            ],
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('AI Chat'), centerTitle: true),
       body: Column(
         children: [
           Padding(
@@ -305,33 +204,6 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
-          if (_lastRagSources.isNotEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              color: Theme.of(context).colorScheme.tertiaryContainer,
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.auto_awesome,
-                    size: 16,
-                    color: Theme.of(context).colorScheme.onTertiaryContainer,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Sources: ${_lastRagSources.join(', ')}',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.onTertiaryContainer,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
           if (_isInitializing)
             Padding(
               padding: const EdgeInsets.all(16),
@@ -376,33 +248,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
             ),
-          if (_attachedImage != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-              child: Row(
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(6),
-                    child: Image.memory(
-                      _attachedImage!,
-                      width: 40,
-                      height: 40,
-                      fit: BoxFit.cover,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  const Text('Image attached', style: TextStyle(fontSize: 12)),
-                  const Spacer(),
-                  IconButton(
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: () => setState(() {
-                      _attachedImage = null;
-                      _attachedMime = null;
-                    }),
-                  ),
-                ],
-              ),
-            ),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
@@ -432,13 +277,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _sendMessage(),
                     ),
-                  ),
-                  IconButton(
-                    onPressed: (_isGenerating || _isInitializing)
-                        ? null
-                        : _attachImage,
-                    icon: const Icon(Icons.image_outlined),
-                    tooltip: 'Attach image',
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
