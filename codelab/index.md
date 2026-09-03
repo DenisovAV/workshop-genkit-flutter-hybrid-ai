@@ -419,11 +419,11 @@ downloaded with `fromNetwork`. `FlutterGemmaModelConfig` needs the same
 `fileType: ModelFileType.litertlm` so `genkit_flutter_gemma` resolves the
 model against the right runtime.
 
-### Retire CloudAIService, LocalAIService, HybridAIService
+### Retire CloudAIService, LocalAIService
 
 ```bash
 git rm lib/services/ai_service.dart lib/services/cloud_ai_service.dart \
-       lib/services/local_ai_service.dart lib/services/hybrid_ai_service.dart
+       lib/services/local_ai_service.dart
 ```
 
 They're replaced by one `AiEngine` that owns a single `Genkit` instance for
@@ -1049,14 +1049,19 @@ await FlutterGemma.installEmbedder()
 
 ### Register the embedder with Genkit
 
+There's no second `Genkit` to build — `AiEngine` already declared the embedder
+back in Step 4, right next to the on-device model in the *same*
+`GenkitFlutterGemmaPlugin`:
+
 ```dart
-_ai = Genkit(plugins: [
-  GenkitFlutterGemmaPlugin(
-    models: const [],
-    embedders: [FlutterGemmaEmbedderConfig(name: 'embedding-gemma-300m')],
-  ),
-]);
+GenkitFlutterGemmaPlugin(
+  models: [FlutterGemmaModelConfig(name: kLocalModel, /* … */)],
+  embedders: [FlutterGemmaEmbedderConfig(name: kEmbedder)], // 'embedding-gemma-300m'
+),
 ```
+
+So the one `AiEngine` Genkit already exposes the embedder — you just call
+`ai.embed(...)` on it (next).
 
 ### Generate embeddings
 
@@ -1119,7 +1124,7 @@ using cosine similarity:
 ```dart
 Future<RagResult> searchAndBuildContext(String query) async {
   // 1. Embed the query
-  final queryEmbeddings = await _ai!.embed(
+  final queryEmbeddings = await _ai.embed(
     embedder: flutterGemma.embedder(_embedderName),
     document: DocumentData(content: [TextPart(text: query)]),
   );
