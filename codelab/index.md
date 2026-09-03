@@ -434,6 +434,7 @@ both plugins.
 Create `lib/services/ai_engine.dart`:
 
 ```dart
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
@@ -493,45 +494,16 @@ class AiEngine {
 
   String get embedderName => kEmbedder;
 
-  Future<void> initialize({void Function(int progress)? onProgress}) async {
-    final plugins = <GenkitPlugin>[];
-
-    if (_geminiApiKey.isNotEmpty) {
-      plugins.add(googleAI(apiKey: _geminiApiKey));
-      cloudReady = true;
-    }
-
-    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
-    // (.litertlm inference) + its LiteRT embedding backend.
-    await FlutterGemma.initialize(
-      inferenceEngines: [LiteRtLmEngine()],
-      embeddingBackends: [LiteRtEmbeddingBackend()],
-    );
-
-    // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
-    // which no registered engine would handle here.
-    await FlutterGemma.installModel(
-      modelType: ModelType.gemmaIt,
-      fileType: ModelFileType.litertlm,
-    )
-        .fromHuggingFace(
-          _hfRepo,
-          file: _hfModelFile,
-          token: _hfToken.isEmpty ? null : _hfToken,
-        )
-        .withProgress((p) => onProgress?.call(p)) // p is int 0..100
-        .install();
-    await FlutterGemma.installEmbedder()
-        .modelFromNetwork(
-          _embeddingModelUrl,
-          token: _hfToken.isEmpty ? null : _hfToken,
-        )
-        .tokenizerFromNetwork(
-          _tokenizerUrl,
-          token: _hfToken.isEmpty ? null : _hfToken,
-        )
-        .install();
-    plugins.add(
+  Future<void> initialize({
+    void Function(int progress)? onProgress,
+    // Skip the embedder download when RAG isn't needed for a given run.
+    bool downloadEmbedder = true,
+  }) async {
+    // Declarative plugin config — always includes the on-device plugin (its
+    // models/embedders are looked up by name later, independent of whether
+    // the install below actually succeeds).
+    final plugins = <GenkitPlugin>[
+      if (_geminiApiKey.isNotEmpty) googleAI(apiKey: _geminiApiKey),
       GenkitFlutterGemmaPlugin(
         models: [
           FlutterGemmaModelConfig(
@@ -540,14 +512,81 @@ class AiEngine {
             fileType: ModelFileType.litertlm,
           ),
         ],
-        embedders: [FlutterGemmaEmbedderConfig(name: kEmbedder)],
+        embedders: downloadEmbedder
+            ? [FlutterGemmaEmbedderConfig(name: kEmbedder)]
+            : const [],
       ),
-    );
-    localReady = true;
+    ];
 
+    // Build Genkit BEFORE any on-device engine registration/install so `_ai`
+    // (and `_resolve`, and the `ai` getter) are always available afterward —
+    // the plugin list above is purely declarative, so cloud resolution below
+    // needs no on-device engine and must not be taken down by a failure
+    // registering/installing it.
     _ai = Genkit(plugins: plugins);
-    _local = await _resolve(flutterGemma.model(kLocalModel));
-    if (cloudReady) _cloud = await _resolve(googleAI.gemini(kCloudModel));
+
+    // CLOUD: needs no install, so its readiness never depends on the local
+    // LLM or the (optional) embedder below.
+    if (_geminiApiKey.isNotEmpty) {
+      try {
+        _cloud = await _resolve(googleAI.gemini(kCloudModel));
+        cloudReady = true;
+      } catch (e) {
+        debugPrint('⚠️ AiEngine: CLOUD backend unavailable — $e');
+        cloudReady = false;
+      }
+    }
+
+    // LOCAL: register the on-device engine, then install + resolve the LLM.
+    // flutter_gemma 1.x registers no engines by default; that registration
+    // lives inside this try/catch (not before Genkit is built above) so an
+    // engine-init failure only suppresses localReady, never cloud.
+    try {
+      // Opt into LiteRT-LM (.litertlm inference) + its LiteRT embedding
+      // backend.
+      await FlutterGemma.initialize(
+        inferenceEngines: [LiteRtLmEngine()],
+        embeddingBackends: [LiteRtEmbeddingBackend()],
+      );
+
+      // fileType MUST be litertlm — installModel defaults to task
+      // (MediaPipe), which no registered engine would handle here.
+      await FlutterGemma.installModel(
+        modelType: ModelType.gemmaIt,
+        fileType: ModelFileType.litertlm,
+      )
+          .fromHuggingFace(
+            _hfRepo,
+            file: _hfModelFile,
+            token: _hfToken.isEmpty ? null : _hfToken,
+          )
+          .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+          .install();
+      _local = await _resolve(flutterGemma.model(kLocalModel));
+      localReady = true;
+    } catch (e) {
+      debugPrint('⚠️ AiEngine: on-device backend unavailable — $e');
+      localReady = false;
+    }
+
+    // EMBEDDER (OPTIONAL): RAG-only, never blocks chat — a failure here must
+    // not flip localReady or rethrow.
+    if (downloadEmbedder && localReady) {
+      try {
+        await FlutterGemma.installEmbedder()
+            .modelFromNetwork(
+              _embeddingModelUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .tokenizerFromNetwork(
+              _tokenizerUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .install();
+      } catch (e) {
+        debugPrint('⚠️ AiEngine: embedder install failed, RAG disabled — $e');
+      }
+    }
 
     // Build AND register every policy's composite model once, right here —
     // not lazily inside modelFor. ai.generate(model: ...) resolves by name
@@ -764,6 +803,11 @@ final userMessage = Message(
   content: [TextPart(text: prompt)],
 );
 
+// Captured before the call: genkit_hybrid doesn't report which branch
+// actually ran, so this is a best-effort demo counter, not an exact count
+// of cloud calls — see the accounting comment below.
+final wasBudgetAvailable = _engine.budgetAvailable;
+
 final stream = _engine.ai.generateStream(
   model: _engine.modelFor(_policy),
   messages: [userMessage],
@@ -772,8 +816,15 @@ await for (final chunk in stream) {
   buffer.write(chunk.text);
   // ... same throttled setState loop as Step 2/3
 }
-if (_policy == PolicyMode.budget || _policy == PolicyMode.cloud) {
-  _engine.cloudCallsSpent++; // demo accounting for CostStrategy
+
+// Best-effort demo counter for CostStrategy: genkit_hybrid exposes no
+// "which branch ran" signal, so a Budget call that transiently fell back
+// to on-device still counts here as spent; Budget stops climbing once the
+// cap is hit either way.
+if (_policy == PolicyMode.cloud) {
+  _engine.cloudCallsSpent++;
+} else if (_policy == PolicyMode.budget && wasBudgetAvailable) {
+  _engine.cloudCallsSpent++;
 }
 ```
 
@@ -909,6 +960,17 @@ case PolicyMode.budget:
   every `cloud`/`budget` call (see the `_sendMessage` snippet above) and
   compares against `budgetCap` (3 by default). `genkit_hybrid` has no billing
   SDK — it only ever sees the resulting `bool`.
+
+> **Smart + image on a cloud outage**: with an attached image, Smart routes
+> to cloud for vision — but if that cloud call itself fails, `WithFallback`
+> still falls back to on-device, which can't see the image and answers from
+> the text alone. Smart silently degrades to text-only on a cloud outage; it
+> doesn't surface that degradation to the user.
+>
+> **Budget shares its counter with Cloud**: `cloudCallsSpent` is one counter,
+> not one per policy — a Cloud-mode send also spends the Budget allowance.
+> Demo Cloud before Budget and the allowance may already be partly (or
+> fully) spent by the time you switch.
 
 ### The capability block
 
