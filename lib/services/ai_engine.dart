@@ -56,13 +56,15 @@ class AiEngine {
   /// can't run in a unit test) and takes already-resolved branch models
   /// directly, then runs the same build+register path [initialize] uses — so
   /// a test driving [modelFor] through `ai.generate` here exercises the real
-  /// registration wiring, not just [strategyFor].
+  /// registration wiring, not just [strategyFor]. [local] is nullable —
+  /// mirrors [cloud] — so a cloud-only engine (the symmetric mirror of the
+  /// cloud-absent case) is constructible too.
   @visibleForTesting
-  AiEngine.forTest({required Genkit ai, required Model local, Model? cloud}) {
+  AiEngine.forTest({required Genkit ai, Model? local, Model? cloud}) {
     _ai = ai;
     _local = local;
     _cloud = cloud;
-    localReady = true;
+    localReady = local != null;
     cloudReady = cloud != null;
     _registerPolicyModels();
   }
@@ -102,17 +104,12 @@ class AiEngine {
       ),
     ];
 
-    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
-    // (.litertlm inference) + its LiteRT embedding backend.
-    await FlutterGemma.initialize(
-      inferenceEngines: [LiteRtLmEngine()],
-      embeddingBackends: [LiteRtEmbeddingBackend()],
-    );
-
-    // Build Genkit BEFORE any model install so `_ai` (and `_resolve`, and the
-    // `ai` getter) are always available afterward — readiness of each
-    // backend is now tracked independently below instead of assuming both
-    // succeeded just because the plugin list was built.
+    // Build Genkit BEFORE any on-device engine registration/install so `_ai`
+    // (and `_resolve`, and the `ai` getter) are always available afterward —
+    // the plugin list above is purely declarative (no I/O, no dependency on
+    // FlutterGemma.initialize() having run), so cloud resolution below needs
+    // no on-device engine and must not be taken down by a failure
+    // registering/installing it.
     _ai = Genkit(plugins: plugins);
 
     // CLOUD: needs no install, so its readiness never depends on the local
@@ -122,13 +119,23 @@ class AiEngine {
         _cloud = await _resolve(googleAI.gemini(kCloudModel));
         cloudReady = true;
       } catch (e) {
-        debugPrint('Cloud model resolve failed: $e');
+        debugPrint('⚠️ AiEngine: CLOUD backend unavailable — $e');
         cloudReady = false;
       }
     }
 
-    // LOCAL: install + resolve the on-device LLM.
+    // LOCAL: register the on-device engine, then install + resolve the LLM.
+    // flutter_gemma 1.x registers no engines by default; that registration
+    // now lives inside this try/catch (not before Genkit is built) so an
+    // engine-init failure only suppresses localReady, never cloud.
     try {
+      // Opt into LiteRT-LM (.litertlm inference) + its LiteRT embedding
+      // backend.
+      await FlutterGemma.initialize(
+        inferenceEngines: [LiteRtLmEngine()],
+        embeddingBackends: [LiteRtEmbeddingBackend()],
+      );
+
       // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
       // which no registered engine would handle here.
       final llm = FlutterGemma.installModel(
@@ -150,7 +157,7 @@ class AiEngine {
       _local = await _resolve(flutterGemma.model(kLocalModel));
       localReady = true;
     } catch (e) {
-      debugPrint('Local model install/resolve failed: $e');
+      debugPrint('⚠️ AiEngine: on-device backend unavailable — $e');
       localReady = false;
     }
 
@@ -169,7 +176,7 @@ class AiEngine {
             )
             .install();
       } catch (e) {
-        debugPrint('Embedder install failed (RAG unavailable): $e');
+        debugPrint('⚠️ AiEngine: embedder install failed, RAG disabled — $e');
       }
     }
 
