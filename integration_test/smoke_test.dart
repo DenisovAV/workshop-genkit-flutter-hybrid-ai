@@ -13,8 +13,10 @@ const _stagedModel =
 // On-device smoke test for FTL / a real device.
 // Run with both secrets:
 //   --dart-define=HF_TOKEN=hf_xxx --dart-define=GEMINI_API_KEY=AIza...
-// It downloads Gemma-3-1B + EmbeddingGemma on first run, then exercises the
-// two real model backends through AiEngine (the paths unit tests can't cover).
+// It downloads Gemma-3-1B on first run (the embedder is intentionally skipped
+// via downloadEmbedder: false — this test exercises generation, not RAG),
+// then exercises the two real model backends through AiEngine (the paths
+// unit tests can't cover).
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
@@ -28,12 +30,13 @@ void main() {
       // Skip the embedder download — this smoke test exercises generation, not RAG.
       await engine.initialize(localModelPath: staged, downloadEmbedder: false);
 
-      // At least one backend must come up — this catches a missing/invalid
-      // HF_TOKEN (local) or GEMINI_API_KEY (cloud).
+      // The on-device backend is mandatory on a device smoke run — the model
+      // is staged/downloaded and HF_TOKEN is provided, so a silently-broken
+      // LiteRT-LM path must fail here, not ship green on cloud alone.
       expect(
-        engine.localReady || engine.cloudReady,
+        engine.localReady,
         isTrue,
-        reason: 'no backend ready — HF_TOKEN and/or GEMINI_API_KEY missing?',
+        reason: 'on-device LiteRT-LM backend failed to initialize',
       );
 
       final msg = Message(

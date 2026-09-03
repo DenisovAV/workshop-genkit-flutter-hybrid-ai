@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
@@ -83,52 +83,11 @@ class AiEngine {
     // Test seam: skip the embedder download when RAG isn't exercised.
     bool downloadEmbedder = true,
   }) async {
-    final plugins = <GenkitPlugin>[];
-
-    if (_geminiApiKey.isNotEmpty) {
-      plugins.add(googleAI(apiKey: _geminiApiKey));
-      cloudReady = true;
-    }
-
-    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
-    // (.litertlm inference) + its LiteRT embedding backend.
-    await FlutterGemma.initialize(
-      inferenceEngines: [LiteRtLmEngine()],
-      embeddingBackends: [LiteRtEmbeddingBackend()],
-    );
-
-    // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
-    // which no registered engine would handle here.
-    final llm = FlutterGemma.installModel(
-      modelType: ModelType.gemmaIt,
-      fileType: ModelFileType.litertlm,
-    );
-    if (localModelPath != null) {
-      await llm.fromFile(localModelPath).install();
-    } else {
-      await llm
-          .fromHuggingFace(
-            _hfRepo,
-            file: _hfModelFile,
-            token: _hfToken.isEmpty ? null : _hfToken,
-          )
-          .withProgress((p) => onProgress?.call(p)) // p is int 0..100
-          .install();
-    }
-
-    if (downloadEmbedder) {
-      await FlutterGemma.installEmbedder()
-          .modelFromNetwork(
-            _embeddingModelUrl,
-            token: _hfToken.isEmpty ? null : _hfToken,
-          )
-          .tokenizerFromNetwork(
-            _tokenizerUrl,
-            token: _hfToken.isEmpty ? null : _hfToken,
-          )
-          .install();
-    }
-    plugins.add(
+    // Declarative plugin config — always includes the on-device plugin (its
+    // models/embedders are looked up by name later, independent of whether
+    // the install below actually succeeds).
+    final plugins = <GenkitPlugin>[
+      if (_geminiApiKey.isNotEmpty) googleAI(apiKey: _geminiApiKey),
       GenkitFlutterGemmaPlugin(
         models: [
           FlutterGemmaModelConfig(
@@ -141,12 +100,78 @@ class AiEngine {
             ? [FlutterGemmaEmbedderConfig(name: kEmbedder)]
             : const [],
       ),
-    );
-    localReady = true;
+    ];
 
+    // flutter_gemma 1.x registers no engines by default. Opt into LiteRT-LM
+    // (.litertlm inference) + its LiteRT embedding backend.
+    await FlutterGemma.initialize(
+      inferenceEngines: [LiteRtLmEngine()],
+      embeddingBackends: [LiteRtEmbeddingBackend()],
+    );
+
+    // Build Genkit BEFORE any model install so `_ai` (and `_resolve`, and the
+    // `ai` getter) are always available afterward — readiness of each
+    // backend is now tracked independently below instead of assuming both
+    // succeeded just because the plugin list was built.
     _ai = Genkit(plugins: plugins);
-    _local = await _resolve(flutterGemma.model(kLocalModel));
-    if (cloudReady) _cloud = await _resolve(googleAI.gemini(kCloudModel));
+
+    // CLOUD: needs no install, so its readiness never depends on the local
+    // LLM or the (optional) embedder below.
+    if (_geminiApiKey.isNotEmpty) {
+      try {
+        _cloud = await _resolve(googleAI.gemini(kCloudModel));
+        cloudReady = true;
+      } catch (e) {
+        debugPrint('Cloud model resolve failed: $e');
+        cloudReady = false;
+      }
+    }
+
+    // LOCAL: install + resolve the on-device LLM.
+    try {
+      // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
+      // which no registered engine would handle here.
+      final llm = FlutterGemma.installModel(
+        modelType: ModelType.gemmaIt,
+        fileType: ModelFileType.litertlm,
+      );
+      if (localModelPath != null) {
+        await llm.fromFile(localModelPath).install();
+      } else {
+        await llm
+            .fromHuggingFace(
+              _hfRepo,
+              file: _hfModelFile,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+            .install();
+      }
+      _local = await _resolve(flutterGemma.model(kLocalModel));
+      localReady = true;
+    } catch (e) {
+      debugPrint('Local model install/resolve failed: $e');
+      localReady = false;
+    }
+
+    // EMBEDDER (OPTIONAL): RAG-only, never blocks chat — a failure here must
+    // not flip localReady or rethrow.
+    if (downloadEmbedder && localReady) {
+      try {
+        await FlutterGemma.installEmbedder()
+            .modelFromNetwork(
+              _embeddingModelUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .tokenizerFromNetwork(
+              _tokenizerUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .install();
+      } catch (e) {
+        debugPrint('Embedder install failed (RAG unavailable): $e');
+      }
+    }
 
     _registerPolicyModels();
   }
