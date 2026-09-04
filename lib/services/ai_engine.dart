@@ -235,6 +235,14 @@ class AiEngine {
       return cascadeModel(
         branches: _branches,
         order: const [kOnDevice, kCloud],
+        // DEMO PROXY — not a real quality signal. A production cascade
+        // escalates on model *confidence*; the best training-free signal is
+        // the reply's average token log-probability. We can't use it here:
+        // LiteRT-LM gives `accept` only decoded text (no per-token
+        // probabilities), and asking a ~1B model to self-rate confidence is
+        // unreliable — small models are confidently wrong. So we escalate on a
+        // crude "too short to be a real answer" check. See the codelab's
+        // "A real cascade signal" note.
         accept: (r) => r.text.trim().length > 20,
         name: 'cascade',
       );
