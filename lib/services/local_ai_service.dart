@@ -1,10 +1,14 @@
 import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit_flutter_gemma/genkit_flutter_gemma.dart';
+
 import 'ai_service.dart';
 
-const String _modelUrl =
-    'https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task';
+// The on-device LLM installs straight from Hugging Face by repo + file.
+const String _hfRepo = 'litert-community/Gemma3-1B-IT';
+const String _hfModelFile =
+    'Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm';
 const String _embeddingModelUrl =
     'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq256_mixed-precision.tflite';
 const String _tokenizerUrl =
@@ -32,14 +36,23 @@ class LocalAIService implements AIService {
   String get embedderName => _embedderName;
 
   @override
-  Future<void> initialize({void Function(double)? onProgress}) async {
+  Future<void> initialize({void Function(int)? onProgress}) async {
     if (_isInitialized) return;
 
-    await FlutterGemma.initialize();
+    // flutter_gemma 1.x registers no engine by default — opt into LiteRT-LM.
+    await FlutterGemma.initialize(inferenceEngines: [LiteRtLmEngine()]);
 
-    await FlutterGemma.installModel(modelType: ModelType.gemmaIt)
-        .fromNetwork(_modelUrl, token: _hfToken.isNotEmpty ? _hfToken : null)
-        .withProgress((p) => onProgress?.call(p / 100))
+    // Download the .litertlm model (skipped if already installed).
+    await FlutterGemma.installModel(
+          modelType: ModelType.gemmaIt,
+          fileType: ModelFileType.litertlm,
+        )
+        .fromHuggingFace(
+          _hfRepo,
+          file: _hfModelFile,
+          token: _hfToken.isEmpty ? null : _hfToken,
+        )
+        .withProgress((p) => onProgress?.call(p)) // p is int 0..100
         .install();
 
     await FlutterGemma.installEmbedder()
@@ -54,17 +67,20 @@ class LocalAIService implements AIService {
         .install();
 
     // One Genkit instance for both inference and embeddings.
-    _ai = Genkit(plugins: [
-      GenkitFlutterGemmaPlugin(
-        models: [
-          FlutterGemmaModelConfig(
-            name: _modelName,
-            modelType: ModelType.gemmaIt,
-          ),
-        ],
-        embedders: [FlutterGemmaEmbedderConfig(name: _embedderName)],
-      ),
-    ]);
+    _ai = Genkit(
+      plugins: [
+        GenkitFlutterGemmaPlugin(
+          models: [
+            FlutterGemmaModelConfig(
+              name: _modelName,
+              modelType: ModelType.gemmaIt,
+              fileType: ModelFileType.litertlm,
+            ),
+          ],
+          embedders: [FlutterGemmaEmbedderConfig(name: _embedderName)],
+        ),
+      ],
+    );
 
     _isInitialized = true;
   }
