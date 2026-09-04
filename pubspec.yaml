@@ -13,18 +13,18 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   # Cloud AI via Gemini API (Genkit)
-  genkit: ^0.15.1
-  genkit_google_genai: ^0.2.12
+  genkit: ^0.16.0
+  genkit_google_genai: ^0.3.1
 
   # On-device AI via genkit_flutter_gemma
-  genkit_flutter_gemma: ^0.5.0
+  genkit_flutter_gemma: ^0.6.0
   flutter_gemma: ^1.7.0
   # LiteRT-LM engine (.litertlm inference) + LiteRT embedding backend —
   # flutter_gemma 1.x registers no engines by default; opt in here.
   flutter_gemma_litertlm: ^1.6.1
 
   # Hybrid on-device ↔ cloud routing
-  genkit_hybrid: ^0.2.0
+  genkit_hybrid: ^0.2.1
 
   # Image input (multimodal)
   image_picker: ^1.2.3

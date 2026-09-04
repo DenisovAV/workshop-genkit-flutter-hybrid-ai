@@ -136,8 +136,8 @@ class AiEngine {
         embeddingBackends: [LiteRtEmbeddingBackend()],
       );
 
-      // fileType MUST be litertlm — installModel defaults to task (MediaPipe),
-      // which no registered engine would handle here.
+      // fileType MUST be litertlm to match the LiteRT-LM engine registered
+      // above.
       final llm = FlutterGemma.installModel(
         modelType: ModelType.gemmaIt,
         fileType: ModelFileType.litertlm,
@@ -186,7 +186,7 @@ class AiEngine {
   // A plugin model is registered by name; genkit's `Model` is an `Action`, so
   // look the concrete model up from the registry and cast.
   Future<Model> _resolve(ModelRef ref) async {
-    final action = await ai.registry.lookupAction('model', ref.name);
+    final action = await ai.registry.lookupAction(ActionType.model, ref.name);
     if (action == null) {
       throw StateError('model "${ref.name}" is not registered');
     }
