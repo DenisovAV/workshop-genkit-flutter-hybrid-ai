@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+
 import '../models/message_model.dart';
 import '../services/cloud_ai_service.dart';
 import '../services/local_ai_service.dart';
@@ -45,12 +46,12 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     try {
-      if (mounted) setState(() => _statusMessage = 'Downloading local model...');
+      if (mounted)
+        setState(() => _statusMessage = 'Downloading local model...');
       await _localService.initialize(
         onProgress: (progress) {
           if (mounted) {
-            setState(() =>
-                _statusMessage = 'Downloading model: ${(progress * 100).toInt()}%');
+            setState(() => _statusMessage = 'Downloading model: $progress%');
           }
         },
       );
@@ -107,8 +108,10 @@ class _ChatScreenState extends State<ChatScreen> {
           _lastUiUpdate = now;
           if (!mounted) return;
           setState(() {
-            _messages.last =
-                ChatMessage(text: buffer.toString(), isUser: false);
+            _messages.last = ChatMessage(
+              text: buffer.toString(),
+              isUser: false,
+            );
           });
           _scrollToBottom();
         }
@@ -174,17 +177,22 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_isInitializing)
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Column(children: [
-                Text(_statusMessage),
-                const SizedBox(height: 8),
-                const LinearProgressIndicator(),
-              ]),
+              child: Column(
+                children: [
+                  Text(_statusMessage),
+                  const SizedBox(height: 8),
+                  const LinearProgressIndicator(),
+                ],
+              ),
             ),
           Expanded(
             child: _messages.isEmpty
                 ? const Center(
-                    child: Text('Send a message to start chatting',
-                        style: TextStyle(color: Colors.grey)))
+                    child: Text(
+                      'Send a message to start chatting',
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  )
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.only(top: 8, bottom: 8),
@@ -196,22 +204,27 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_isGenerating)
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Row(children: [
-                SizedBox(
+              child: Row(
+                children: [
+                  SizedBox(
                     width: 16,
                     height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2)),
-                SizedBox(width: 8),
-                Text('Generating...', style: TextStyle(color: Colors.grey)),
-              ]),
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 8),
+                  Text('Generating...', style: TextStyle(color: Colors.grey)),
+                ],
+              ),
             ),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
               color: Theme.of(context).colorScheme.surface,
               border: Border(
-                  top: BorderSide(
-                      color: Theme.of(context).colorScheme.outlineVariant)),
+                top: BorderSide(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+              ),
             ),
             child: SafeArea(
               child: Row(
@@ -222,10 +235,12 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: const InputDecoration(
                         hintText: 'Type a message...',
                         border: OutlineInputBorder(
-                            borderRadius:
-                                BorderRadius.all(Radius.circular(24))),
+                          borderRadius: BorderRadius.all(Radius.circular(24)),
+                        ),
                         contentPadding: EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 10),
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
                       ),
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _sendMessage(),
