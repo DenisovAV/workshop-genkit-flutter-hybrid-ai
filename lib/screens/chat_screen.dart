@@ -26,8 +26,6 @@ class _ChatScreenState extends State<ChatScreen> {
   double _downloadProgress = 0;
   String _statusMessage = 'Initializing...';
 
-  bool _cloudReady = false;
-  bool _localReady = false;
   bool _ragReady = false;
 
   late final AiEngine _engine;
@@ -54,8 +52,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _initServices() async {
     try {
-      if (mounted)
+      if (mounted) {
         setState(() => _statusMessage = 'Downloading local model...');
+      }
       await _engine.initialize(
         onProgress: (p) {
           if (mounted) setState(() => _downloadProgress = p / 100);
@@ -65,10 +64,7 @@ class _ChatScreenState extends State<ChatScreen> {
       debugPrint('AiEngine init failed: $e');
     }
 
-    _cloudReady = _engine.cloudReady;
-    _localReady = _engine.localReady;
-
-    if (_localReady) {
+    if (_engine.localReady) {
       try {
         if (mounted) setState(() => _statusMessage = 'Setting up RAG...');
         final rag = RagService(
@@ -88,14 +84,14 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (!mounted) return;
-    final defaultPolicy = switch ((_cloudReady, _localReady)) {
+    final defaultPolicy = switch ((_engine.cloudReady, _engine.localReady)) {
       (true, _) => PolicyMode.cloud,
       (false, true) => PolicyMode.local,
       _ => PolicyMode.cloud,
     };
     final parts = [
-      if (_cloudReady) 'cloud',
-      if (_localReady) 'local',
+      if (_engine.cloudReady) 'cloud',
+      if (_engine.localReady) 'local',
       if (_ragReady) 'RAG',
     ];
     setState(() {
@@ -139,11 +135,18 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  /// Both send entry points (the button and the text field's submit action)
+  /// gate on this: nothing in flight, and at least one backend resolved.
+  bool get _canSend =>
+      !_isGenerating &&
+      !_isInitializing &&
+      (_engine.cloudReady || _engine.localReady);
+
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isGenerating) return;
 
-    if (_attachedImage != null && _engine.requiresTextOnly(_policy)) {
+    if (_attachedImage != null && _policy.textOnly) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
@@ -166,7 +169,6 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _scrollToBottom();
 
-    var generationSucceeded = false;
     try {
       String prompt = text;
 
@@ -220,7 +222,6 @@ class _ChatScreenState extends State<ChatScreen> {
           _scrollToBottom();
         }
       }
-      generationSucceeded = true;
 
       // Best-effort demo counter for CostStrategy: genkit_hybrid exposes no
       // "which branch ran" signal, so a Budget call that transiently fell
@@ -252,16 +253,6 @@ class _ChatScreenState extends State<ChatScreen> {
           _isGenerating = false;
           _attachedImage = null;
           _attachedMime = null;
-          // Clean up the placeholder only when generation neither succeeded
-          // nor errored (e.g. interrupted before either branch above ran) —
-          // a successful-but-empty response is shown as '(no response)'
-          // above instead of silently vanishing here.
-          if (!generationSucceeded &&
-              _messages.isNotEmpty &&
-              !_messages.last.isUser &&
-              _messages.last.text.isEmpty) {
-            _messages.removeLast();
-          }
         });
       }
     }
@@ -296,31 +287,15 @@ class _ChatScreenState extends State<ChatScreen> {
               value: _policy,
               isExpanded: true,
               items: [
-                DropdownMenuItem(
-                  value: PolicyMode.cloud,
-                  enabled: _cloudReady,
-                  child: const Text('Cloud'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.local,
-                  enabled: _localReady,
-                  child: const Text('Local'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.smart,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Smart (image-aware)'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.cascade,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Cascade (escalate on quality)'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.budget,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Budget (cost-gated)'),
-                ),
+                for (final mode in PolicyMode.values)
+                  DropdownMenuItem(
+                    value: mode,
+                    enabled: mode.availableWith(
+                      cloud: _engine.cloudReady,
+                      local: _engine.localReady,
+                    ),
+                    child: Text(mode.label),
+                  ),
               ],
               onChanged: (m) {
                 if (m != null) setState(() => _policy = m);
@@ -452,7 +427,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                       textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => _sendMessage(),
+                      onSubmitted: (_) {
+                        if (_canSend) _sendMessage();
+                      },
                     ),
                   ),
                   IconButton(
@@ -464,9 +441,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
-                    onPressed: (_isGenerating || _isInitializing)
-                        ? null
-                        : _sendMessage,
+                    onPressed: _canSend ? _sendMessage : null,
                     icon: const Icon(Icons.send),
                   ),
                 ],

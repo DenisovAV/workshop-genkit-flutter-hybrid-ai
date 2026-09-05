@@ -44,32 +44,30 @@ void main() {
         content: [TextPart(text: 'Reply with a short greeting.')],
       );
 
-      if (engine.localReady) {
-        final resp = await engine.ai.generate(
-          model: engine.modelFor(PolicyMode.local),
-          messages: [msg],
-        );
-        expect(
-          resp.text.trim(),
-          isNotEmpty,
-          reason: 'on-device (Gemma-3-1B) produced empty text',
-        );
-        // ignore: avoid_print
-        print('[smoke] LOCAL ok (chars=${resp.text.trim().length})');
-      }
+      final resp = await engine.ai.generate(
+        model: engine.modelFor(PolicyMode.local),
+        messages: [msg],
+      );
+      expect(
+        resp.text.trim(),
+        isNotEmpty,
+        reason: 'on-device (Gemma-3-1B) produced empty text',
+      );
+      // ignore: avoid_print
+      print('[smoke] LOCAL ok (chars=${resp.text.trim().length})');
 
       if (engine.cloudReady) {
-        final resp = await engine.ai.generate(
+        final cloudResp = await engine.ai.generate(
           model: engine.modelFor(PolicyMode.cloud),
           messages: [msg],
         );
         expect(
-          resp.text.trim(),
+          cloudResp.text.trim(),
           isNotEmpty,
           reason: 'cloud (gemini-3.7-flash) produced empty text',
         );
         // ignore: avoid_print
-        print('[smoke] CLOUD ok (chars=${resp.text.trim().length})');
+        print('[smoke] CLOUD ok (chars=${cloudResp.text.trim().length})');
       }
     },
     timeout: const Timeout(Duration(minutes: 20)),

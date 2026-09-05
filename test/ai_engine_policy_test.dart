@@ -40,6 +40,22 @@ Model fakeBranch(String name, String text, {void Function()? onCall}) => Model(
   },
 );
 
+// Records the request each branch actually received, so a test can assert on
+// the config the branch was handed rather than on a canned return value.
+Model capturingBranch(String name, List<ModelRequest?> seen) => Model(
+  name: name,
+  fn: (request, context) async {
+    seen.add(request);
+    return ModelResponse(
+      finishReason: FinishReason.stop,
+      message: Message(
+        role: Role.model,
+        content: [TextPart(text: name)],
+      ),
+    );
+  },
+);
+
 void main() {
   test('cloud mode always routes to cloud', () {
     expect(AiEngine().strategyFor(PolicyMode.cloud).route(_ctx()), [kCloud]);
@@ -56,22 +72,14 @@ void main() {
     ]);
   });
 
-  test(
-    'smart mode: an image is routed to cloud only (capability), plus fallback',
-    () {
-      // The inner CapabilityStrategy excludes the text-only on-device model when
-      // an image is present; WithFallback then appends it as the safety tail.
-      // NOTE: this only checks that smart routes cloud-first for an image
-      // request. `AiEngine.strategyFor` returns a composed `RoutingStrategy`
-      // with no observable way to assert per-modality capability detection
-      // in isolation — the real image guard is `requiresTextOnly`, which has
-      // its own test below.
-      final route = AiEngine()
-          .strategyFor(PolicyMode.smart)
-          .route(_ctx(withImage: true));
-      expect(route.first, kCloud);
-    },
-  );
+  test('smart mode: an image is routed to cloud only (capability)', () {
+    // CapabilityStrategy excludes the text-only on-device model when an
+    // image is present, since it declares no vision capability.
+    final route = AiEngine()
+        .strategyFor(PolicyMode.smart)
+        .route(_ctx(withImage: true));
+    expect(route, [kCloud]);
+  });
 
   test('budget mode: premium while budget holds, cheap once spent', () {
     final e = AiEngine()
@@ -82,12 +90,50 @@ void main() {
     expect(e.strategyFor(PolicyMode.budget).route(_ctx()), [kOnDevice]);
   });
 
-  test('requiresTextOnly is true only for local and cascade', () {
-    final e = AiEngine();
-    expect(e.requiresTextOnly(PolicyMode.local), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.cascade), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.smart), isFalse);
-    expect(e.requiresTextOnly(PolicyMode.cloud), isFalse);
+  // --------------------------------------------------------------------
+  // The enum carries its own facts — dropdown label, text-only-ness, and
+  // which branches its composite needs — so the UI and _registerPolicyModels
+  // read them instead of re-deriving them. This table is the single place
+  // those facts are pinned; a new mode without a row fails the first expect.
+  test('PolicyMode carries label, textOnly and branch requirements', () {
+    // mode -> (label, textOnly, availableWith over the four (cloud, local)
+    // combinations in `combos` order).
+    const combos = [(false, false), (false, true), (true, false), (true, true)];
+    const expected = <PolicyMode, (String, bool, List<bool>)>{
+      PolicyMode.cloud: ('Cloud', false, [false, false, true, true]),
+      PolicyMode.local: ('Local', true, [false, true, false, true]),
+      PolicyMode.smart: (
+        'Smart (image-aware)',
+        false,
+        [false, false, false, true],
+      ),
+      PolicyMode.cascade: (
+        'Cascade (escalate on quality)',
+        true,
+        [false, false, false, true],
+      ),
+      PolicyMode.budget: (
+        'Budget (cost-gated)',
+        false,
+        [false, false, false, true],
+      ),
+    };
+
+    expect(expected.keys, PolicyMode.values, reason: 'a new mode needs a row');
+
+    for (final MapEntry(key: mode, value: (label, textOnly, availability))
+        in expected.entries) {
+      expect(mode.label, label, reason: '${mode.name} label');
+      expect(mode.textOnly, textOnly, reason: '${mode.name} textOnly');
+      expect(
+        [
+          for (final (cloud, local) in combos)
+            mode.availableWith(cloud: cloud, local: local),
+        ],
+        availability,
+        reason: '${mode.name} availableWith',
+      );
+    }
   });
 
   // --------------------------------------------------------------------
@@ -135,6 +181,83 @@ void main() {
         expect(resp.text, 'LOCAL');
       },
     );
+  });
+
+  // --------------------------------------------------------------------
+  // Context budget: genkit_flutter_gemma reads `maxTokens` only from the
+  // per-request config and defaults it to 1024, which the RAG prompt blows
+  // past ("Input token ids are too long … 1713 >= 1024" on device). AiEngine
+  // wraps the on-device branch so each request carries
+  // kOnDeviceContextTokens — and only that branch: Gemini has no such key.
+  group('on-device context budget', () {
+    test('on-device branch is handed the 4096-token window', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: capturingBranch('flutter-gemma/local', seen),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      await ai.generate(model: engine.modelFor(PolicyMode.local), prompt: 'hi');
+
+      expect(seen.single?.config?['maxTokens'], kOnDeviceContextTokens);
+    });
+
+    test('cloud branch is handed no maxTokens', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: fakeBranch('flutter-gemma/local', 'LOCAL'),
+        cloud: capturingBranch('googleai/cloud', seen),
+      );
+
+      await ai.generate(model: engine.modelFor(PolicyMode.cloud), prompt: 'hi');
+
+      expect(seen.single?.config?['maxTokens'], isNull);
+    });
+
+    test('an explicit maxTokens on the request wins', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: capturingBranch('flutter-gemma/local', seen),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      await ai.generate(
+        model: engine.modelFor(PolicyMode.local),
+        prompt: 'hi',
+        config: <String, dynamic>{'maxTokens': 2048},
+      );
+
+      expect(seen.single?.config?['maxTokens'], 2048);
+    });
+
+    // The one that actually holds the wrapper's copy-don't-mutate shape in
+    // place. Cascade drives BOTH branches over the very same ModelRequest
+    // object (genkit_hybrid's runInOrder: `branches[order[i]]!.fn(request,
+    // context)`), on-device first. A wrapper that merged with
+    // `request.config = ...` instead of copying would pass every other test
+    // here and still hand Gemini a Gemma-only maxTokens on each escalation.
+    test('cascade escalation does not leak maxTokens to cloud', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: fakeBranch('flutter-gemma/local', 'short'), // <=20 -> escalate
+        cloud: capturingBranch('googleai/cloud', seen),
+      );
+
+      await ai.generate(
+        model: engine.modelFor(PolicyMode.cascade),
+        prompt: 'hi',
+      );
+
+      expect(seen.single?.config?['maxTokens'], isNull);
+    });
   });
 
   // --------------------------------------------------------------------
@@ -195,8 +318,8 @@ void main() {
 
   // --------------------------------------------------------------------
   // Cloud-absent guard: no API key -> AiEngine.forTest omits `cloud` (it's
-  // already nullable) -> _registerPolicyModels only registers `local`
-  // (every other mode requires the kCloud branch per _hasRequiredBranches).
+  // already nullable) -> _registerPolicyModels only registers the modes whose
+  // `PolicyMode.availableWith` holds — here just `local`.
   group('cloud-absent guard', () {
     test(
       'local works without a cloud branch; every cloud-needing policy throws',
@@ -209,22 +332,26 @@ void main() {
 
         expect(engine.cloudReady, isFalse);
         expect(engine.modelFor(PolicyMode.local), isNotNull);
-        expect(
-          () => engine.modelFor(PolicyMode.cloud),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.smart),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.cascade),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.budget),
-          throwsA(isA<StateError>()),
-        );
+        // Filtered off the engine's own readiness (not literals) so the
+        // filter can't drift from the fixture, and pinned to a length so an
+        // `availableWith` that stopped excluding anything empties the loop
+        // below into a vacuous green instead of failing here.
+        final modes = PolicyMode.values
+            .where(
+              (m) => !m.availableWith(
+                cloud: engine.cloudReady,
+                local: engine.localReady,
+              ),
+            )
+            .toList();
+        expect(modes, hasLength(4));
+        for (final mode in modes) {
+          expect(
+            () => engine.modelFor(mode),
+            throwsA(isA<StateError>()),
+            reason: '${mode.name} needs the cloud branch',
+          );
+        }
       },
     );
   });
@@ -254,22 +381,24 @@ void main() {
         );
         expect(resp.text, 'CLOUD');
 
-        expect(
-          () => engine.modelFor(PolicyMode.local),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.smart),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.cascade),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.budget),
-          throwsA(isA<StateError>()),
-        );
+        // Same shape as the cloud-absent guard: read the fixture's readiness,
+        // and pin the count so the loop can never go vacuously green.
+        final modes = PolicyMode.values
+            .where(
+              (m) => !m.availableWith(
+                cloud: engine.cloudReady,
+                local: engine.localReady,
+              ),
+            )
+            .toList();
+        expect(modes, hasLength(4));
+        for (final mode in modes) {
+          expect(
+            () => engine.modelFor(mode),
+            throwsA(isA<StateError>()),
+            reason: '${mode.name} needs the on-device branch',
+          );
+        }
       },
     );
   });

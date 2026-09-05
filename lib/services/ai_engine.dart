@@ -24,9 +24,43 @@ const kLocalModel = 'gemma-3-1b-it';
 const kCloudModel = 'gemini-3.7-flash';
 const kEmbedder = 'embedding-gemma-300m';
 
+/// Context window for the on-device branch, in tokens. `maxTokens` is the
+/// WHOLE window (input + output) and genkit_flutter_gemma defaults it to 1024.
+/// RagService's take(3) of ~600-token city guides alone is ~1.7k tokens —
+/// measured on device: "Input token ids are too long … 1713 >= 1024". The
+/// bundled Gemma-3-1B `.litertlm` is built for 4096 (`ekv4096`), so use it.
+const kOnDeviceContextTokens = 4096;
+
 /// The five routing policies the chat exposes. Each maps to one genkit_hybrid
 /// construct (see [modelFor] / [strategyFor]).
-enum PolicyMode { cloud, local, smart, cascade, budget }
+enum PolicyMode {
+  cloud('Cloud', needsLocal: false),
+  local('Local', needsCloud: false, textOnly: true),
+  smart('Smart (image-aware)'),
+  cascade('Cascade (escalate on quality)', textOnly: true),
+  budget('Budget (cost-gated)');
+
+  const PolicyMode(
+    this.label, {
+    this.needsCloud = true,
+    this.needsLocal = true,
+    this.textOnly = false,
+  });
+
+  /// Dropdown text.
+  final String label;
+
+  /// Which branches the composite for this mode requires.
+  final bool needsCloud;
+  final bool needsLocal;
+
+  /// True when the primary route starts on the text-only on-device model, so
+  /// an attached image cannot be handled (the UI blocks send with a hint).
+  final bool textOnly;
+
+  bool availableWith({required bool cloud, required bool local}) =>
+      (!needsCloud || cloud) && (!needsLocal || local);
+}
 
 /// Owns a single Genkit instance with both plugins (cloud + on-device),
 /// resolves the two base models, and composes them via genkit_hybrid per the
@@ -62,7 +96,7 @@ class AiEngine {
   @visibleForTesting
   AiEngine.forTest({required Genkit ai, Model? local, Model? cloud}) {
     _ai = ai;
-    _local = local;
+    _local = local == null ? null : _withContextBudget(local);
     _cloud = cloud;
     localReady = local != null;
     cloudReady = cloud != null;
@@ -154,7 +188,9 @@ class AiEngine {
             .withProgress((p) => onProgress?.call(p)) // p is int 0..100
             .install();
       }
-      _local = await _resolve(flutterGemma.model(kLocalModel));
+      _local = _withContextBudget(
+        await _resolve(flutterGemma.model(kLocalModel)),
+      );
       localReady = true;
     } catch (e) {
       debugPrint('⚠️ AiEngine: on-device backend unavailable — $e');
@@ -193,10 +229,35 @@ class AiEngine {
     return action as Model;
   }
 
-  Map<String, Model> get _branches => {
-    if (_local != null) kOnDevice: _local!,
-    if (_cloud != null) kCloud: _cloud!,
-  };
+  /// Wraps the on-device [inner] model so every request reaching it carries a
+  /// context window big enough for the RAG prompt. genkit_flutter_gemma reads
+  /// `maxTokens` ONLY from the per-request `request.config` (defaulting to
+  /// 1024) — registration-time [FlutterGemmaModelConfig] has no options field
+  /// — so the budget has to ride along with each request. genkit_hybrid calls
+  /// a branch as `branch.fn(request, context)`, so forwarding the same
+  /// `context` leaves streaming and fallback untouched. Only the on-device
+  /// branch is wrapped: Gemini's config has no `maxTokens` key. An explicit
+  /// request `maxTokens` wins. The request is COPIED, never mutated — cascade
+  /// hands the very same object to the cloud branch next. [inner]'s metadata
+  /// is forwarded as a COPY too: genkit's `Model` constructor writes into the
+  /// map it is handed, so passing `inner.metadata` itself would rewrite the
+  /// wrapped model's own metadata.
+  Model _withContextBudget(Model inner) => Model(
+    name: '${inner.name}/ctx',
+    metadata: {...inner.metadata},
+    fn: (request, context) {
+      if (request == null || request.config?['maxTokens'] != null) {
+        return inner.fn(request, context);
+      }
+      final budgeted = ModelRequest.fromJson({
+        ...request.toJson(),
+        'config': {...?request.config, 'maxTokens': kOnDeviceContextTokens},
+      });
+      return inner.fn(budgeted, context);
+    },
+  );
+
+  Map<String, Model> get _branches => {kOnDevice: ?_local, kCloud: ?_cloud};
 
   /// Builds AND registers one composite [Model] per [PolicyMode] whose
   /// required branches are available, populating [_models]. A mode that needs
@@ -205,25 +266,13 @@ class AiEngine {
   /// crashing here on a half-built `cascadeModel` (its `order` validates
   /// eagerly against `branches`, unlike `hybridModel`).
   void _registerPolicyModels() {
-    final branches = _branches;
     for (final mode in PolicyMode.values) {
-      if (!_hasRequiredBranches(mode, branches)) continue;
+      if (!mode.availableWith(cloud: _cloud != null, local: _local != null)) {
+        continue;
+      }
       final model = _buildModel(mode);
       ai.registry.register(model);
       _models[mode] = model;
-    }
-  }
-
-  bool _hasRequiredBranches(PolicyMode mode, Map<String, Model> branches) {
-    switch (mode) {
-      case PolicyMode.cloud:
-        return branches.containsKey(kCloud);
-      case PolicyMode.local:
-        return branches.containsKey(kOnDevice);
-      case PolicyMode.smart:
-      case PolicyMode.cascade:
-      case PolicyMode.budget:
-        return branches.containsKey(kOnDevice) && branches.containsKey(kCloud);
     }
   }
 
@@ -277,17 +326,17 @@ class AiEngine {
       case PolicyMode.local:
         return PreRoutingStrategy((_) => kOnDevice);
       case PolicyMode.smart:
-        // Image → cloud (only it declares vision). Text → cloud-first (kCloud
-        // listed first), on-device as the transient-failure fallback (an
-        // offline cloud call throws → hybridModel falls to on-device).
-        return WithFallback(
-          CapabilityStrategy(
-            supports: {
-              kCloud: {ModelCapability.vision},
-              kOnDevice: <ModelCapability>{},
-            },
-          ),
-          fallbackOrder: const [kOnDevice],
+        // Image → cloud only (only it declares vision). Text → both qualify,
+        // cloud-first in `supports` insertion order, on-device as the tail.
+        // No WithFallback: CapabilityStrategy already yields the on-device
+        // tail for text, and for an image a forced on-device tail would hand
+        // the picture to a model that cannot see it. Offline + image should
+        // fail loudly, not silently degrade to text-only.
+        return CapabilityStrategy(
+          supports: {
+            kCloud: {ModelCapability.vision},
+            kOnDevice: <ModelCapability>{},
+          },
         );
       case PolicyMode.budget:
         return CostStrategy(
@@ -300,12 +349,7 @@ class AiEngine {
     }
   }
 
-  /// True when [mode]'s primary route starts on the text-only on-device model,
-  /// so an attached image cannot be handled (used to block send with a hint).
-  bool requiresTextOnly(PolicyMode mode) =>
-      mode == PolicyMode.local || mode == PolicyMode.cascade;
-
-  Future<void> dispose() async {
+  void dispose() {
     _ai = null;
     _local = null;
     _cloud = null;
