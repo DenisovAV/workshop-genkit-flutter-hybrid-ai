@@ -197,6 +197,29 @@ void main() {
 
       expect(seen.single?.config?['maxTokens'], 2048);
     });
+
+    // The one that actually holds the wrapper's copy-don't-mutate shape in
+    // place. Cascade drives BOTH branches over the very same ModelRequest
+    // object (genkit_hybrid's runInOrder: `branches[order[i]]!.fn(request,
+    // context)`), on-device first. A wrapper that merged with
+    // `request.config = ...` instead of copying would pass every other test
+    // here and still hand Gemini a Gemma-only maxTokens on each escalation.
+    test('cascade escalation does not leak maxTokens to cloud', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: fakeBranch('flutter-gemma/local', 'short'), // <=20 -> escalate
+        cloud: capturingBranch('googleai/cloud', seen),
+      );
+
+      await ai.generate(
+        model: engine.modelFor(PolicyMode.cascade),
+        prompt: 'hi',
+      );
+
+      expect(seen.single?.config?['maxTokens'], isNull);
+    });
   });
 
   // --------------------------------------------------------------------
