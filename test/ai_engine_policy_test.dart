@@ -43,6 +43,25 @@ Model fakeBranch(String name, String text, {void Function()? onCall}) => Model(
   },
 );
 
+// Emits [chunks] through the streaming callback before returning the assembled
+// reply — the two fakes around it never call `sendChunk`, so without this one
+// nothing exercises the `await for … yield chunk.text` half of `send()`.
+Model streamingBranch(String name, List<String> chunks) => Model(
+  name: name,
+  fn: (request, context) async {
+    for (final text in chunks) {
+      context.sendChunk(ModelResponseChunk(content: [TextPart(text: text)]));
+    }
+    return ModelResponse(
+      finishReason: FinishReason.stop,
+      message: Message(
+        role: Role.model,
+        content: [TextPart(text: chunks.join())],
+      ),
+    );
+  },
+);
+
 // Records the request each branch actually received, so a test can assert on
 // the config the branch was handed rather than on a canned return value.
 Model capturingBranch(String name, List<ModelRequest?> seen) => Model(
@@ -335,9 +354,20 @@ void main() {
 
         expect(engine.cloudReady, isFalse);
         expect(engine.modelFor(PolicyMode.local), isNotNull);
-        for (final mode in PolicyMode.values.where(
-          (m) => !m.availableWith(cloud: false, local: true),
-        )) {
+        // Filtered off the engine's own readiness (not literals) so the
+        // filter can't drift from the fixture, and pinned to a length so an
+        // `availableWith` that stopped excluding anything empties the loop
+        // below into a vacuous green instead of failing here.
+        final modes = PolicyMode.values
+            .where(
+              (m) => !m.availableWith(
+                cloud: engine.cloudReady,
+                local: engine.localReady,
+              ),
+            )
+            .toList();
+        expect(modes, hasLength(4));
+        for (final mode in modes) {
           expect(
             () => engine.modelFor(mode),
             throwsA(isA<StateError>()),
@@ -383,6 +413,27 @@ void main() {
       await engine.send(PolicyMode.budget, 'hi').drain<void>();
 
       expect(engine.cloudCallsSpent, engine.budgetCap);
+    });
+
+    // send() is a Stream, and the tests above only drain it. This one pins
+    // that the branch's chunks come out one by one, in order: drop the
+    // `yield chunk.text` and the reply silently becomes an empty stream.
+    test('streams the branch reply chunk by chunk', () async {
+      final engine = AiEngine.forTest(
+        ai: Genkit(isDevEnv: false),
+        local: streamingBranch('flutter-gemma/local', const [
+          'Hel',
+          'lo ',
+          '!',
+        ]),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      expect(await engine.send(PolicyMode.local, 'hi').toList(), [
+        'Hel',
+        'lo ',
+        '!',
+      ]);
     });
 
     test('local policy spends nothing', () async {
@@ -452,9 +503,18 @@ void main() {
         );
         expect(resp.text, 'CLOUD');
 
-        for (final mode in PolicyMode.values.where(
-          (m) => !m.availableWith(cloud: true, local: false),
-        )) {
+        // Same shape as the cloud-absent guard: read the fixture's readiness,
+        // and pin the count so the loop can never go vacuously green.
+        final modes = PolicyMode.values
+            .where(
+              (m) => !m.availableWith(
+                cloud: engine.cloudReady,
+                local: engine.localReady,
+              ),
+            )
+            .toList();
+        expect(modes, hasLength(4));
+        for (final mode in modes) {
           expect(
             () => engine.modelFor(mode),
             throwsA(isA<StateError>()),

@@ -243,9 +243,13 @@ class AiEngine {
   /// `context` leaves streaming and fallback untouched. Only the on-device
   /// branch is wrapped: Gemini's config has no `maxTokens` key. An explicit
   /// request `maxTokens` wins. The request is COPIED, never mutated — cascade
-  /// hands the very same object to the cloud branch next.
+  /// hands the very same object to the cloud branch next. [inner]'s metadata
+  /// is forwarded as a COPY too: genkit's `Model` constructor writes into the
+  /// map it is handed, so passing `inner.metadata` itself would rewrite the
+  /// wrapped model's own metadata.
   Model _withContextBudget(Model inner) => Model(
     name: '${inner.name}/ctx',
+    metadata: {...inner.metadata},
     fn: (request, context) {
       if (request == null || request.config?['maxTokens'] != null) {
         return inner.fn(request, context);
