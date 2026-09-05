@@ -75,11 +75,10 @@ void main() {
   });
 
   test('requiresTextOnly is true only for local and cascade', () {
-    final e = AiEngine();
-    expect(e.requiresTextOnly(PolicyMode.local), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.cascade), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.smart), isFalse);
-    expect(e.requiresTextOnly(PolicyMode.cloud), isFalse);
+    expect(PolicyMode.local.textOnly, isTrue);
+    expect(PolicyMode.cascade.textOnly, isTrue);
+    expect(PolicyMode.smart.textOnly, isFalse);
+    expect(PolicyMode.cloud.textOnly, isFalse);
   });
 
   // --------------------------------------------------------------------
@@ -188,7 +187,7 @@ void main() {
   // --------------------------------------------------------------------
   // Cloud-absent guard: no API key -> AiEngine.forTest omits `cloud` (it's
   // already nullable) -> _registerPolicyModels only registers `local`
-  // (every other mode requires the kCloud branch per _hasRequiredBranches).
+  // (every other mode requires the kCloud branch per PolicyMode.availableWith).
   group('cloud-absent guard', () {
     test(
       'local works without a cloud branch; every cloud-needing policy throws',
