@@ -90,12 +90,50 @@ void main() {
     expect(e.strategyFor(PolicyMode.budget).route(_ctx()), [kOnDevice]);
   });
 
-  test('requiresTextOnly is true only for local and cascade', () {
-    final e = AiEngine();
-    expect(e.requiresTextOnly(PolicyMode.local), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.cascade), isTrue);
-    expect(e.requiresTextOnly(PolicyMode.smart), isFalse);
-    expect(e.requiresTextOnly(PolicyMode.cloud), isFalse);
+  // --------------------------------------------------------------------
+  // The enum carries its own facts — dropdown label, text-only-ness, and
+  // which branches its composite needs — so the UI and _registerPolicyModels
+  // read them instead of re-deriving them. This table is the single place
+  // those facts are pinned; a new mode without a row fails the first expect.
+  test('PolicyMode carries label, textOnly and branch requirements', () {
+    // mode -> (label, textOnly, availableWith over the four (cloud, local)
+    // combinations in `combos` order).
+    const combos = [(false, false), (false, true), (true, false), (true, true)];
+    const expected = <PolicyMode, (String, bool, List<bool>)>{
+      PolicyMode.cloud: ('Cloud', false, [false, false, true, true]),
+      PolicyMode.local: ('Local', true, [false, true, false, true]),
+      PolicyMode.smart: (
+        'Smart (image-aware)',
+        false,
+        [false, false, false, true],
+      ),
+      PolicyMode.cascade: (
+        'Cascade (escalate on quality)',
+        true,
+        [false, false, false, true],
+      ),
+      PolicyMode.budget: (
+        'Budget (cost-gated)',
+        false,
+        [false, false, false, true],
+      ),
+    };
+
+    expect(expected.keys, PolicyMode.values, reason: 'a new mode needs a row');
+
+    for (final MapEntry(key: mode, value: (label, textOnly, availability))
+        in expected.entries) {
+      expect(mode.label, label, reason: '${mode.name} label');
+      expect(mode.textOnly, textOnly, reason: '${mode.name} textOnly');
+      expect(
+        [
+          for (final (cloud, local) in combos)
+            mode.availableWith(cloud: cloud, local: local),
+        ],
+        availability,
+        reason: '${mode.name} availableWith',
+      );
+    }
   });
 
   // --------------------------------------------------------------------
@@ -280,8 +318,8 @@ void main() {
 
   // --------------------------------------------------------------------
   // Cloud-absent guard: no API key -> AiEngine.forTest omits `cloud` (it's
-  // already nullable) -> _registerPolicyModels only registers `local`
-  // (every other mode requires the kCloud branch per _hasRequiredBranches).
+  // already nullable) -> _registerPolicyModels only registers the modes whose
+  // `PolicyMode.availableWith` holds — here just `local`.
   group('cloud-absent guard', () {
     test(
       'local works without a cloud branch; every cloud-needing policy throws',
@@ -294,22 +332,15 @@ void main() {
 
         expect(engine.cloudReady, isFalse);
         expect(engine.modelFor(PolicyMode.local), isNotNull);
-        expect(
-          () => engine.modelFor(PolicyMode.cloud),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.smart),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.cascade),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.budget),
-          throwsA(isA<StateError>()),
-        );
+        for (final mode in PolicyMode.values.where(
+          (m) => !m.availableWith(cloud: false, local: true),
+        )) {
+          expect(
+            () => engine.modelFor(mode),
+            throwsA(isA<StateError>()),
+            reason: '${mode.name} needs the cloud branch',
+          );
+        }
       },
     );
   });
@@ -339,22 +370,15 @@ void main() {
         );
         expect(resp.text, 'CLOUD');
 
-        expect(
-          () => engine.modelFor(PolicyMode.local),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.smart),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.cascade),
-          throwsA(isA<StateError>()),
-        );
-        expect(
-          () => engine.modelFor(PolicyMode.budget),
-          throwsA(isA<StateError>()),
-        );
+        for (final mode in PolicyMode.values.where(
+          (m) => !m.availableWith(cloud: true, local: false),
+        )) {
+          expect(
+            () => engine.modelFor(mode),
+            throwsA(isA<StateError>()),
+            reason: '${mode.name} needs the on-device branch',
+          );
+        }
       },
     );
   });

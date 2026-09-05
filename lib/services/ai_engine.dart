@@ -33,7 +33,34 @@ const kOnDeviceContextTokens = 4096;
 
 /// The five routing policies the chat exposes. Each maps to one genkit_hybrid
 /// construct (see [modelFor] / [strategyFor]).
-enum PolicyMode { cloud, local, smart, cascade, budget }
+enum PolicyMode {
+  cloud('Cloud', needsLocal: false),
+  local('Local', needsCloud: false, textOnly: true),
+  smart('Smart (image-aware)'),
+  cascade('Cascade (escalate on quality)', textOnly: true),
+  budget('Budget (cost-gated)');
+
+  const PolicyMode(
+    this.label, {
+    this.needsCloud = true,
+    this.needsLocal = true,
+    this.textOnly = false,
+  });
+
+  /// Dropdown text.
+  final String label;
+
+  /// Which branches the composite for this mode requires.
+  final bool needsCloud;
+  final bool needsLocal;
+
+  /// True when the primary route starts on the text-only on-device model, so
+  /// an attached image cannot be handled (the UI blocks send with a hint).
+  final bool textOnly;
+
+  bool availableWith({required bool cloud, required bool local}) =>
+      (!needsCloud || cloud) && (!needsLocal || local);
+}
 
 /// Owns a single Genkit instance with both plugins (cloud + on-device),
 /// resolves the two base models, and composes them via genkit_hybrid per the
@@ -235,25 +262,13 @@ class AiEngine {
   /// crashing here on a half-built `cascadeModel` (its `order` validates
   /// eagerly against `branches`, unlike `hybridModel`).
   void _registerPolicyModels() {
-    final branches = _branches;
     for (final mode in PolicyMode.values) {
-      if (!_hasRequiredBranches(mode, branches)) continue;
+      if (!mode.availableWith(cloud: _cloud != null, local: _local != null)) {
+        continue;
+      }
       final model = _buildModel(mode);
       ai.registry.register(model);
       _models[mode] = model;
-    }
-  }
-
-  bool _hasRequiredBranches(PolicyMode mode, Map<String, Model> branches) {
-    switch (mode) {
-      case PolicyMode.cloud:
-        return branches.containsKey(kCloud);
-      case PolicyMode.local:
-        return branches.containsKey(kOnDevice);
-      case PolicyMode.smart:
-      case PolicyMode.cascade:
-      case PolicyMode.budget:
-        return branches.containsKey(kOnDevice) && branches.containsKey(kCloud);
     }
   }
 
@@ -329,11 +344,6 @@ class AiEngine {
         throw ArgumentError('cascade has no RoutingStrategy; use modelFor');
     }
   }
-
-  /// True when [mode]'s primary route starts on the text-only on-device model,
-  /// so an attached image cannot be handled (used to block send with a hint).
-  bool requiresTextOnly(PolicyMode mode) =>
-      mode == PolicyMode.local || mode == PolicyMode.cascade;
 
   Future<void> dispose() async {
     _ai = null;
