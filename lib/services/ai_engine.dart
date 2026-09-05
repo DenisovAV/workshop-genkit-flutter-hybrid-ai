@@ -1,10 +1,5 @@
-import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
-// `Message` is genkit's here — flutter_gemma exports a chat Message of its own,
-// but this file only ever builds genkit requests.
-import 'package:flutter_gemma/flutter_gemma.dart' hide Message;
+import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit/plugin.dart' show GenkitPlugin;
@@ -319,53 +314,6 @@ class AiEngine {
       );
     }
     return model;
-  }
-
-  /// One chat turn: builds the user message (text, plus an image as a data
-  /// URI with an explicit image/* contentType — the on-device plugin drops
-  /// media without one and CapabilityStrategy reads it to detect vision),
-  /// streams the reply through the composite for [mode], and does the budget
-  /// accounting afterwards. [prompt] is the final prompt — already
-  /// RAG-augmented by the caller when RAG is on.
-  Stream<String> send(
-    PolicyMode mode,
-    String prompt, {
-    Uint8List? imageBytes,
-    String? imageMime,
-  }) async* {
-    // Captured before the call: genkit_hybrid doesn't report which branch
-    // actually ran, so this is a best-effort demo counter, not an exact
-    // count of cloud calls — see the accounting comment below.
-    final wasBudgetAvailable = budgetAvailable;
-
-    final content = <Part>[TextPart(text: prompt)];
-    if (imageBytes != null) {
-      final mime = imageMime ?? 'image/jpeg';
-      final dataUri = 'data:$mime;base64,${base64Encode(imageBytes)}';
-      content.add(
-        MediaPart(
-          media: Media(contentType: mime, url: dataUri),
-        ),
-      );
-    }
-
-    final stream = ai.generateStream(
-      model: modelFor(mode),
-      messages: [Message(role: Role.user, content: content)],
-    );
-    await for (final chunk in stream) {
-      yield chunk.text;
-    }
-
-    // Best-effort demo counter for CostStrategy: genkit_hybrid exposes no
-    // "which branch ran" signal, so a Budget call that transiently fell
-    // back to on-device still counts here as spent; Budget stops climbing
-    // once the cap is hit either way.
-    if (mode == PolicyMode.cloud) {
-      cloudCallsSpent++;
-    } else if (mode == PolicyMode.budget && wasBudgetAvailable) {
-      cloudCallsSpent++;
-    }
   }
 
   /// Pure policy → RoutingStrategy mapping (no models needed), so the routing

@@ -1,6 +1,3 @@
-import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:genkit/genkit.dart';
 import 'package:genkit_hybrid/genkit_hybrid.dart';
@@ -38,25 +35,6 @@ Model fakeBranch(String name, String text, {void Function()? onCall}) => Model(
       message: Message(
         role: Role.model,
         content: [TextPart(text: text)],
-      ),
-    );
-  },
-);
-
-// Emits [chunks] through the streaming callback before returning the assembled
-// reply — the two fakes around it never call `sendChunk`, so without this one
-// nothing exercises the `await for … yield chunk.text` half of `send()`.
-Model streamingBranch(String name, List<String> chunks) => Model(
-  name: name,
-  fn: (request, context) async {
-    for (final text in chunks) {
-      context.sendChunk(ModelResponseChunk(content: [TextPart(text: text)]));
-    }
-    return ModelResponse(
-      finishReason: FinishReason.stop,
-      message: Message(
-        role: Role.model,
-        content: [TextPart(text: chunks.join())],
       ),
     );
   },
@@ -374,106 +352,6 @@ void main() {
             reason: '${mode.name} needs the cloud branch',
           );
         }
-      },
-    );
-  });
-
-  // --------------------------------------------------------------------
-  // send(): the turn itself — message construction and the CostStrategy demo
-  // counter — lives on the engine, so it is testable without pumping a
-  // widget. The counter is what the Budget policy routes on, and it used to
-  // be incremented by the chat screen.
-  group('send()', () {
-    AiEngine engineWith(Genkit ai) => AiEngine.forTest(
-      ai: ai,
-      local: fakeBranch('flutter-gemma/local', 'LOCAL'),
-      cloud: fakeBranch('googleai/cloud', 'CLOUD'),
-    );
-
-    test('cloud policy spends one cloud call', () async {
-      final engine = engineWith(Genkit(isDevEnv: false));
-
-      await engine.send(PolicyMode.cloud, 'hi').drain<void>();
-
-      expect(engine.cloudCallsSpent, 1);
-    });
-
-    test('budget policy spends a call while the budget holds', () async {
-      final engine = engineWith(Genkit(isDevEnv: false));
-
-      await engine.send(PolicyMode.budget, 'hi').drain<void>();
-
-      expect(engine.cloudCallsSpent, 1);
-    });
-
-    test('budget policy spends nothing once the cap is reached', () async {
-      final engine = engineWith(Genkit(isDevEnv: false));
-      engine.cloudCallsSpent = engine.budgetCap;
-
-      await engine.send(PolicyMode.budget, 'hi').drain<void>();
-
-      expect(engine.cloudCallsSpent, engine.budgetCap);
-    });
-
-    // send() is a Stream, and the tests above only drain it. This one pins
-    // that the branch's chunks come out one by one, in order: drop the
-    // `yield chunk.text` and the reply silently becomes an empty stream.
-    test('streams the branch reply chunk by chunk', () async {
-      final engine = AiEngine.forTest(
-        ai: Genkit(isDevEnv: false),
-        local: streamingBranch('flutter-gemma/local', const [
-          'Hel',
-          'lo ',
-          '!',
-        ]),
-        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
-      );
-
-      expect(await engine.send(PolicyMode.local, 'hi').toList(), [
-        'Hel',
-        'lo ',
-        '!',
-      ]);
-    });
-
-    test('local policy spends nothing', () async {
-      final engine = engineWith(Genkit(isDevEnv: false));
-
-      await engine.send(PolicyMode.local, 'hi').drain<void>();
-
-      expect(engine.cloudCallsSpent, 0);
-    });
-
-    // The image has to reach the branch as a MediaPart with an image/*
-    // contentType: the on-device plugin drops media without one, and
-    // CapabilityStrategy reads it to route Smart's image turns to cloud.
-    test(
-      'an attached image reaches the branch as an image MediaPart',
-      () async {
-        final seen = <ModelRequest?>[];
-        final bytes = Uint8List.fromList([0]);
-        final engine = AiEngine.forTest(
-          ai: Genkit(isDevEnv: false),
-          local: fakeBranch('flutter-gemma/local', 'LOCAL'),
-          cloud: capturingBranch('googleai/cloud', seen),
-        );
-
-        await engine
-            .send(
-              PolicyMode.smart,
-              'hi',
-              imageBytes: bytes,
-              imageMime: 'image/png',
-            )
-            .drain<void>();
-
-        final media = seen.single!.messages.single.content
-            .map((p) => p.mediaPart)
-            .nonNulls
-            .single
-            .media;
-        expect(media.contentType, 'image/png');
-        expect(media.url, 'data:image/png;base64,${base64Encode(bytes)}');
       },
     );
   });
