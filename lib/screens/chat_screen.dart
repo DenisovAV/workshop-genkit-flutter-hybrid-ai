@@ -22,9 +22,6 @@ class _ChatScreenState extends State<ChatScreen> {
   double _downloadProgress = 0;
   String _statusMessage = 'Initializing...';
 
-  bool _cloudReady = false;
-  bool _localReady = false;
-
   late final AiEngine _engine;
 
   PolicyMode _policy = PolicyMode.cloud;
@@ -53,16 +50,16 @@ class _ChatScreenState extends State<ChatScreen> {
       debugPrint('AiEngine init failed: $e');
     }
 
-    _cloudReady = _engine.cloudReady;
-    _localReady = _engine.localReady;
-
     if (!mounted) return;
-    final defaultPolicy = switch ((_cloudReady, _localReady)) {
+    final defaultPolicy = switch ((_engine.cloudReady, _engine.localReady)) {
       (true, _) => PolicyMode.cloud,
       (false, true) => PolicyMode.local,
       _ => PolicyMode.cloud,
     };
-    final parts = [if (_cloudReady) 'cloud', if (_localReady) 'local'];
+    final parts = [
+      if (_engine.cloudReady) 'cloud',
+      if (_engine.localReady) 'local',
+    ];
     setState(() {
       _isInitializing = false;
       _policy = defaultPolicy;
@@ -196,31 +193,15 @@ class _ChatScreenState extends State<ChatScreen> {
               value: _policy,
               isExpanded: true,
               items: [
-                DropdownMenuItem(
-                  value: PolicyMode.cloud,
-                  enabled: _cloudReady,
-                  child: const Text('Cloud'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.local,
-                  enabled: _localReady,
-                  child: const Text('Local'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.smart,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Smart (image-aware)'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.cascade,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Cascade (escalate on quality)'),
-                ),
-                DropdownMenuItem(
-                  value: PolicyMode.budget,
-                  enabled: _cloudReady && _localReady,
-                  child: const Text('Budget (cost-gated)'),
-                ),
+                for (final mode in PolicyMode.values)
+                  DropdownMenuItem(
+                    value: mode,
+                    enabled: mode.availableWith(
+                      cloud: _engine.cloudReady,
+                      local: _engine.localReady,
+                    ),
+                    child: Text(mode.label),
+                  ),
               ],
               onChanged: (m) {
                 if (m != null) setState(() => _policy = m);
