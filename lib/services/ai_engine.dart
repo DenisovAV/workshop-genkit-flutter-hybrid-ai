@@ -277,17 +277,17 @@ class AiEngine {
       case PolicyMode.local:
         return PreRoutingStrategy((_) => kOnDevice);
       case PolicyMode.smart:
-        // Image → cloud (only it declares vision). Text → cloud-first (kCloud
-        // listed first), on-device as the transient-failure fallback (an
-        // offline cloud call throws → hybridModel falls to on-device).
-        return WithFallback(
-          CapabilityStrategy(
-            supports: {
-              kCloud: {ModelCapability.vision},
-              kOnDevice: <ModelCapability>{},
-            },
-          ),
-          fallbackOrder: const [kOnDevice],
+        // Image → cloud only (only it declares vision). Text → both qualify,
+        // cloud-first in `supports` insertion order, on-device as the tail.
+        // No WithFallback: CapabilityStrategy already yields the on-device
+        // tail for text, and for an image a forced on-device tail would hand
+        // the picture to a model that cannot see it. Offline + image should
+        // fail loudly, not silently degrade to text-only.
+        return CapabilityStrategy(
+          supports: {
+            kCloud: {ModelCapability.vision},
+            kOnDevice: <ModelCapability>{},
+          },
         );
       case PolicyMode.budget:
         return CostStrategy(

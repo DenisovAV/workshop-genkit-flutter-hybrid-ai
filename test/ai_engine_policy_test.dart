@@ -56,22 +56,14 @@ void main() {
     ]);
   });
 
-  test(
-    'smart mode: an image is routed to cloud only (capability), plus fallback',
-    () {
-      // The inner CapabilityStrategy excludes the text-only on-device model when
-      // an image is present; WithFallback then appends it as the safety tail.
-      // NOTE: this only checks that smart routes cloud-first for an image
-      // request. `AiEngine.strategyFor` returns a composed `RoutingStrategy`
-      // with no observable way to assert per-modality capability detection
-      // in isolation — the real image guard is `requiresTextOnly`, which has
-      // its own test below.
-      final route = AiEngine()
-          .strategyFor(PolicyMode.smart)
-          .route(_ctx(withImage: true));
-      expect(route.first, kCloud);
-    },
-  );
+  test('smart mode: an image is routed to cloud only (capability)', () {
+    // CapabilityStrategy excludes the text-only on-device model when an
+    // image is present, since it declares no vision capability.
+    final route = AiEngine()
+        .strategyFor(PolicyMode.smart)
+        .route(_ctx(withImage: true));
+    expect(route, [kCloud]);
+  });
 
   test('budget mode: premium while budget holds, cheap once spent', () {
     final e = AiEngine()
