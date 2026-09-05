@@ -24,6 +24,13 @@ const kLocalModel = 'gemma-3-1b-it';
 const kCloudModel = 'gemini-3.7-flash';
 const kEmbedder = 'embedding-gemma-300m';
 
+/// Context window for the on-device branch, in tokens. `maxTokens` is the
+/// WHOLE window (input + output) and genkit_flutter_gemma defaults it to 1024.
+/// RagService's take(3) of ~600-token city guides alone is ~1.7k tokens —
+/// measured on device: "Input token ids are too long … 1713 >= 1024". The
+/// bundled Gemma-3-1B `.litertlm` is built for 4096 (`ekv4096`), so use it.
+const kOnDeviceContextTokens = 4096;
+
 /// The five routing policies the chat exposes. Each maps to one genkit_hybrid
 /// construct (see [modelFor] / [strategyFor]).
 enum PolicyMode { cloud, local, smart, cascade, budget }
@@ -62,7 +69,7 @@ class AiEngine {
   @visibleForTesting
   AiEngine.forTest({required Genkit ai, Model? local, Model? cloud}) {
     _ai = ai;
-    _local = local;
+    _local = local == null ? null : _withContextBudget(local);
     _cloud = cloud;
     localReady = local != null;
     cloudReady = cloud != null;
@@ -154,7 +161,9 @@ class AiEngine {
             .withProgress((p) => onProgress?.call(p)) // p is int 0..100
             .install();
       }
-      _local = await _resolve(flutterGemma.model(kLocalModel));
+      _local = _withContextBudget(
+        await _resolve(flutterGemma.model(kLocalModel)),
+      );
       localReady = true;
     } catch (e) {
       debugPrint('⚠️ AiEngine: on-device backend unavailable — $e');
@@ -192,6 +201,27 @@ class AiEngine {
     }
     return action as Model;
   }
+
+  /// Wraps the on-device branch so every request carries the context budget
+  /// unless the caller set one. Copies the request rather than mutating it:
+  /// genkit_hybrid hands the SAME ModelRequest to the next branch when
+  /// cascade escalates, so an in-place write would leak a Gemma-only
+  /// maxTokens into the Gemini call. The metadata copy is required too —
+  /// genkit's Model constructor writes into the map it is handed.
+  Model _withContextBudget(Model inner) => Model(
+    name: '${inner.name}/ctx',
+    metadata: {...inner.metadata},
+    fn: (request, context) {
+      if (request == null || request.config?['maxTokens'] != null) {
+        return inner.fn(request, context);
+      }
+      final budgeted = ModelRequest.fromJson({
+        ...request.toJson(),
+        'config': {...?request.config, 'maxTokens': kOnDeviceContextTokens},
+      });
+      return inner.fn(budgeted, context);
+    },
+  );
 
   Map<String, Model> get _branches => {
     if (_local != null) kOnDevice: _local!,
@@ -277,17 +307,17 @@ class AiEngine {
       case PolicyMode.local:
         return PreRoutingStrategy((_) => kOnDevice);
       case PolicyMode.smart:
-        // Image → cloud (only it declares vision). Text → cloud-first (kCloud
-        // listed first), on-device as the transient-failure fallback (an
-        // offline cloud call throws → hybridModel falls to on-device).
-        return WithFallback(
-          CapabilityStrategy(
-            supports: {
-              kCloud: {ModelCapability.vision},
-              kOnDevice: <ModelCapability>{},
-            },
-          ),
-          fallbackOrder: const [kOnDevice],
+        // Image → cloud only (only it declares vision). Text → both qualify,
+        // cloud-first in `supports` insertion order, on-device as the tail.
+        // No WithFallback: CapabilityStrategy already yields the on-device
+        // tail for text, and for an image a forced on-device tail would hand
+        // the picture to a model that cannot see it. Offline + image should
+        // fail loudly, not silently degrade to text-only.
+        return CapabilityStrategy(
+          supports: {
+            kCloud: {ModelCapability.vision},
+            kOnDevice: <ModelCapability>{},
+          },
         );
       case PolicyMode.budget:
         return CostStrategy(
