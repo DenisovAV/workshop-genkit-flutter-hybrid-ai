@@ -1,8 +1,6 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:genkit/genkit.dart';
 import 'package:image_picker/image_picker.dart';
 import '../models/message_model.dart';
 import '../services/ai_engine.dart';
@@ -135,6 +133,13 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  /// Both send entry points (the button and the text field's submit action)
+  /// gate on this: nothing in flight, and at least one backend resolved.
+  bool get _canSend =>
+      !_isGenerating &&
+      !_isInitializing &&
+      (_engine.cloudReady || _engine.localReady);
+
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isGenerating) return;
@@ -162,7 +167,6 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _scrollToBottom();
 
-    var generationSucceeded = false;
     try {
       String prompt = text;
 
@@ -175,34 +179,17 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      final content = <Part>[TextPart(text: prompt)];
-      if (_attachedImage != null) {
-        final mime = _attachedMime ?? 'image/jpeg';
-        final dataUri = 'data:$mime;base64,${base64Encode(_attachedImage!)}';
-        // contentType MUST be set: the on-device plugin drops media without an
-        // image/* contentType, and CapabilityStrategy reads it to detect vision.
-        content.add(
-          MediaPart(
-            media: Media(contentType: mime, url: dataUri),
-          ),
-        );
-      }
-      final userMessage = Message(role: Role.user, content: content);
-
       final buffer = StringBuffer();
       _lastUiUpdate = DateTime.now();
 
-      // Captured before the call: genkit_hybrid doesn't report which branch
-      // actually ran, so this is a best-effort demo counter, not an exact
-      // count of cloud calls — see the accounting comment below.
-      final wasBudgetAvailable = _engine.budgetAvailable;
-
-      final stream = _engine.ai.generateStream(
-        model: _engine.modelFor(_policy),
-        messages: [userMessage],
+      final stream = _engine.send(
+        _policy,
+        prompt,
+        imageBytes: _attachedImage,
+        imageMime: _attachedMime,
       );
       await for (final chunk in stream) {
-        buffer.write(chunk.text);
+        buffer.write(chunk);
         final now = DateTime.now();
         if (now.difference(_lastUiUpdate) >= _uiUpdateInterval) {
           _lastUiUpdate = now;
@@ -215,17 +202,6 @@ class _ChatScreenState extends State<ChatScreen> {
           });
           _scrollToBottom();
         }
-      }
-      generationSucceeded = true;
-
-      // Best-effort demo counter for CostStrategy: genkit_hybrid exposes no
-      // "which branch ran" signal, so a Budget call that transiently fell
-      // back to on-device still counts here as spent; Budget stops climbing
-      // once the cap is hit either way.
-      if (_policy == PolicyMode.cloud) {
-        _engine.cloudCallsSpent++;
-      } else if (_policy == PolicyMode.budget && wasBudgetAvailable) {
-        _engine.cloudCallsSpent++;
       }
 
       if (!mounted) return;
@@ -248,16 +224,6 @@ class _ChatScreenState extends State<ChatScreen> {
           _isGenerating = false;
           _attachedImage = null;
           _attachedMime = null;
-          // Clean up the placeholder only when generation neither succeeded
-          // nor errored (e.g. interrupted before either branch above ran) —
-          // a successful-but-empty response is shown as '(no response)'
-          // above instead of silently vanishing here.
-          if (!generationSucceeded &&
-              _messages.isNotEmpty &&
-              !_messages.last.isUser &&
-              _messages.last.text.isEmpty) {
-            _messages.removeLast();
-          }
         });
       }
     }
@@ -432,7 +398,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                       textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => _sendMessage(),
+                      onSubmitted: (_) {
+                        if (_canSend) _sendMessage();
+                      },
                     ),
                   ),
                   IconButton(
@@ -444,9 +412,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
-                    onPressed: (_isGenerating || _isInitializing)
-                        ? null
-                        : _sendMessage,
+                    onPressed: _canSend ? _sendMessage : null,
                     icon: const Icon(Icons.send),
                   ),
                 ],
