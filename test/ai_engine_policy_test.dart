@@ -40,6 +40,22 @@ Model fakeBranch(String name, String text, {void Function()? onCall}) => Model(
   },
 );
 
+// Records the request each branch actually received, so a test can assert on
+// the config the branch was handed rather than on a canned return value.
+Model capturingBranch(String name, List<ModelRequest?> seen) => Model(
+  name: name,
+  fn: (request, context) async {
+    seen.add(request);
+    return ModelResponse(
+      finishReason: FinishReason.stop,
+      message: Message(
+        role: Role.model,
+        content: [TextPart(text: name)],
+      ),
+    );
+  },
+);
+
 void main() {
   test('cloud mode always routes to cloud', () {
     expect(AiEngine().strategyFor(PolicyMode.cloud).route(_ctx()), [kCloud]);
@@ -127,6 +143,60 @@ void main() {
         expect(resp.text, 'LOCAL');
       },
     );
+  });
+
+  // --------------------------------------------------------------------
+  // Context budget: genkit_flutter_gemma reads `maxTokens` only from the
+  // per-request config and defaults it to 1024, which the RAG prompt blows
+  // past ("Input token ids are too long … 1713 >= 1024" on device). AiEngine
+  // wraps the on-device branch so each request carries
+  // kOnDeviceContextTokens — and only that branch: Gemini has no such key.
+  group('on-device context budget', () {
+    test('on-device branch is handed the 4096-token window', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: capturingBranch('flutter-gemma/local', seen),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      await ai.generate(model: engine.modelFor(PolicyMode.local), prompt: 'hi');
+
+      expect(seen.single?.config?['maxTokens'], kOnDeviceContextTokens);
+    });
+
+    test('cloud branch is handed no maxTokens', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: fakeBranch('flutter-gemma/local', 'LOCAL'),
+        cloud: capturingBranch('googleai/cloud', seen),
+      );
+
+      await ai.generate(model: engine.modelFor(PolicyMode.cloud), prompt: 'hi');
+
+      expect(seen.single?.config?['maxTokens'], isNull);
+    });
+
+    test('an explicit maxTokens on the request wins', () async {
+      final seen = <ModelRequest?>[];
+      final ai = Genkit(isDevEnv: false);
+      final engine = AiEngine.forTest(
+        ai: ai,
+        local: capturingBranch('flutter-gemma/local', seen),
+        cloud: fakeBranch('googleai/cloud', 'CLOUD'),
+      );
+
+      await ai.generate(
+        model: engine.modelFor(PolicyMode.local),
+        prompt: 'hi',
+        config: <String, dynamic>{'maxTokens': 2048},
+      );
+
+      expect(seen.single?.config?['maxTokens'], 2048);
+    });
   });
 
   // --------------------------------------------------------------------
