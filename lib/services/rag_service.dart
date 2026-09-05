@@ -18,6 +18,12 @@ const List<String> _cityFiles = [
   'singapore',
 ];
 
+/// Minimum cosine similarity threshold for RAG retrieval results.
+const double kMinSimilarity = 0.5;
+
+/// Maximum number of documents to retrieve from the vector store.
+const int kTopK = 3;
+
 class _VectorDocument {
   final String id;
   final String content;
@@ -43,12 +49,7 @@ class RagService {
   final List<_VectorDocument> _store = [];
   bool _isInitialized = false;
 
-  bool get isInitialized => _isInitialized;
-  int get documentCount => _store.length;
-
-  RagService({required Genkit ai, required String embedderName})
-      : _ai = ai,
-        _embedderName = embedderName;
+  RagService({required this._ai, required this._embedderName});
 
   Future<void> initialize({void Function(String status)? onStatus}) async {
     if (_isInitialized) return;
@@ -63,8 +64,9 @@ class RagService {
   Future<void> _loadTouristData(void Function(String)? onStatus) async {
     for (final city in _cityFiles) {
       onStatus?.call('Embedding $city...');
-      final jsonString =
-          await rootBundle.loadString('assets/tourist_data/$city.json');
+      final jsonString = await rootBundle.loadString(
+        'assets/tourist_data/$city.json',
+      );
       final data = jsonDecode(jsonString) as Map<String, dynamic>;
 
       final name = data['name'] as String? ?? city;
@@ -75,12 +77,14 @@ class RagService {
         document: DocumentData(content: [TextPart(text: content)]),
       );
 
-      _store.add(_VectorDocument(
-        id: city,
-        content: content,
-        city: name,
-        embedding: embeddings.first.embedding,
-      ));
+      _store.add(
+        _VectorDocument(
+          id: city,
+          content: content,
+          city: name,
+          embedding: embeddings.first.embedding,
+        ),
+      );
     }
   }
 
@@ -106,17 +110,23 @@ class RagService {
     );
     final queryVector = queryEmbeddings.first.embedding;
 
-    final scored = _store
-        .map((doc) => (doc: doc, score: _cosine(queryVector, doc.embedding)))
-        .where((r) => r.score >= 0.5)
-        .toList()
-      ..sort((a, b) => b.score.compareTo(a.score));
+    final scored =
+        _store
+            .map(
+              (doc) => (doc: doc, score: _cosine(queryVector, doc.embedding)),
+            )
+            .where((r) => r.score >= kMinSimilarity)
+            .toList()
+          ..sort((a, b) => b.score.compareTo(a.score));
 
-    final topK = scored.take(3).toList();
+    final topK = scored.take(kTopK).toList();
 
     if (topK.isEmpty) {
       return RagResult(
-          augmentedPrompt: query, retrievedContext: '', sources: []);
+        augmentedPrompt: query,
+        retrievedContext: '',
+        sources: [],
+      );
     }
 
     final context = topK.map((r) => r.doc.content).join('\n\n');
@@ -136,8 +146,11 @@ class RagService {
   }
 
   double _cosine(List<double> a, List<double> b) {
-    assert(a.length == b.length,
-        'Embedding dimensions must match: ${a.length} != ${b.length}');
+    if (a.length != b.length) {
+      throw ArgumentError(
+        'Embedding dimensions must match: ${a.length} != ${b.length}',
+      );
+    }
     double dot = 0, normA = 0, normB = 0;
     for (int i = 0; i < a.length; i++) {
       dot += a[i] * b[i];
@@ -148,7 +161,7 @@ class RagService {
     return denom == 0 ? 0.0 : dot / denom;
   }
 
-  Future<void> dispose() async {
+  void dispose() {
     _store.clear();
     _isInitialized = false;
   }

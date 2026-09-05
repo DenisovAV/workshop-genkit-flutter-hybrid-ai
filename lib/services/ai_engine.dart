@@ -397,7 +397,7 @@ class AiEngine {
     }
   }
 
-  Future<void> dispose() async {
+  void dispose() {
     _ai = null;
     _local = null;
     _cloud = null;

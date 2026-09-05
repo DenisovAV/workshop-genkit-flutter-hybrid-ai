@@ -44,19 +44,17 @@ void main() {
         content: [TextPart(text: 'Reply with a short greeting.')],
       );
 
-      if (engine.localReady) {
-        final resp = await engine.ai.generate(
-          model: engine.modelFor(PolicyMode.local),
-          messages: [msg],
-        );
-        expect(
-          resp.text.trim(),
-          isNotEmpty,
-          reason: 'on-device (Gemma-3-1B) produced empty text',
-        );
-        // ignore: avoid_print
-        print('[smoke] LOCAL ok (chars=${resp.text.trim().length})');
-      }
+      final resp = await engine.ai.generate(
+        model: engine.modelFor(PolicyMode.local),
+        messages: [msg],
+      );
+      expect(
+        resp.text.trim(),
+        isNotEmpty,
+        reason: 'on-device (Gemma-3-1B) produced empty text',
+      );
+      // ignore: avoid_print
+      print('[smoke] LOCAL ok (chars=${resp.text.trim().length})');
 
       if (engine.cloudReady) {
         final resp = await engine.ai.generate(
